@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "taskwarden"
+version = "0.1.0"
+description = "A durable, owner-approved AI team for a business: agents as folders, tools by risk, owner approvals that survive restarts, on Postgres."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "DAHO" }]
+requires-python = ">=3.11"
+dependencies = ["sqlalchemy[asyncio]>=2.0", "pyyaml>=6.0"]
+keywords = ["agents", "llm", "human-in-the-loop", "approvals", "multi-agent", "durable", "sqlalchemy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Framework :: AsyncIO",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "aiosqlite>=0.20"]
+
+[project.urls]
+Repository = "https://github.com/dahoai/taskwarden"
+
+[tool.hatch.build.targets.wheel]
+packages = ["taskwarden"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
