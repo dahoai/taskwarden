@@ -54,6 +54,18 @@ class Host(Protocol):
                             now: datetime,
                             channel: Optional[str], business_type: Optional[str],
                             self_started: bool, loaded: set[str]) -> str: ...
+    async def thought(self, organization_id: str, thread: str, agent_id: str, text: str) -> None:
+        """The model's reasoning on its latest turn, for a live "why" beside the progress
+        line. Optional; called only when the model thinks."""
+    async def take_messages(self, task: Any) -> list[str]:
+        """What the owner wrote to this task while it ran, removed as it is taken: the run
+        reads it at the start of each round and before it finishes. Optional."""
+    async def stop_asked(self, task: Any) -> bool:
+        """The owner pressed Stop on this task: checked before each model call and each tool,
+        so the run ends cleanly at the next step (loop.stop). Optional."""
+    def clock(self, now: datetime) -> Optional[str]:
+        """The time, in words, for the first message of each request. Kept out of the system
+        prompt: a prefix that changes every minute is never served from the model's cache."""
     def local_schemas(self, channel: Optional[str], task: Any) -> list[dict]:
         """Tools the host answers inside the loop itself (a `show` that draws a table, say)."""
     async def local_call(self, db: Any, organization_id: str, name: str, args: dict,
@@ -125,6 +137,8 @@ class BaseHost:
     NEVER_WAITS_NEEDS_OWNER = ("Not done: this needs the owner, and this task can't wait for "
                                "them. Put it in your report.")
     OUT_OF_STEPS = "I ran out of steps before finishing. Ask me to carry on."
+    STOPPED_REPLY = "Stopped."
+    STOPPED_DID = "Done before that: {did}."
 
     # ── Write these ──
     async def llm(self, db: Any, organization_id: str) -> tuple[Any, str]:
@@ -133,6 +147,15 @@ class BaseHost:
     async def system_prompt(self, db, task, agent, name, teammates, now, channel,
                             business_type, self_started, loaded) -> str:
         raise NotImplementedError("return the words the agent reads first")
+
+    async def take_messages(self, task) -> list[str]:
+        return []  # write it to let the owner add to a request while it runs
+
+    async def stop_asked(self, task) -> bool:
+        return False  # write it (a flag in Redis, say) to give the owner a Stop button
+
+    def clock(self, now) -> Optional[str]:
+        return f"Right now it is {now:%A %Y-%m-%d %H:%M} ({now.tzname()})."
 
     # ── The roster ──
     def agent(self, agent_id: str) -> Any:

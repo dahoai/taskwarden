@@ -81,7 +81,8 @@ async def claim(host, db, organization_id: str, task_id: Any, decision: str):
 async def apply(host, db, organization_id: str, task: Any, decision: str, *,
                 note: Optional[str] = None, answer: Optional[str] = None, resume: bool = False,
                 declined_calls: Optional[list[str]] = None,
-                edited_args: Optional[dict[str, dict]] = None) -> None:
+                edited_args: Optional[dict[str, dict]] = None,
+                shown: Optional[str] = None) -> None:
     """Carry out a claimed decision: run what was approved (or record the decline, the change
     asked for, or the answer), hand the results to the task and post the decision to its
     thread. `task` is the claimed task, or its id from another session. `declined_calls`: on an
@@ -149,7 +150,9 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
     if not is_approval:
         results = [{"role": "tool", "tool_call_id": pending.get("tool_call_id", ""),
                     "content": f"Owner answered: {answer or note or ''}"}]
-    echo, kind = answer or note or "", "text"
+    # `shown`: how the chat shows the owner's answer when it differs from what the agent
+    # reads (a file's name, not the whole file).
+    echo, kind = shown or answer or note or "", "text"
     if is_approval and decision != "revise":
         # What was decided, as data: the app words it for the owner, and the team's history
         # reads it back as one line.

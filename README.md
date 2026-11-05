@@ -118,7 +118,8 @@ await sweeper.sweep(host, Session, redis, now=now, run=run) # on a timer: resume
 `BaseHost` leaves out what only your app can know. Override it as you grow:
 `sent_key` / `reach_key` (turn on the duplicate-send guard), `notify_parked` (push, SMS or
 email the owner), `refuse_run` (credits), `context` (the business's time zone), `audit`
-(store the trail), `mark` (live progress).
+(store the trail), `mark` (live progress), `thought` (the model's reasoning, as it works), `take_messages` (what the owner writes while a task runs joins it), `stop_asked` (the owner's Stop: the run ends at its next step and says what it did), `clock` (how the time reads; it rides on the
+first message of each request, never in the system prompt, so the prompt stays cached).
 
 ## Risk levels
 

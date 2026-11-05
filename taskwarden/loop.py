@@ -77,7 +77,10 @@ PRACTICE = ("Practice mode: not done, nothing was sent or changed.\n{call}\nCarr
             "request, and list in your report each action you would have taken.")
 MAX_DELEGATIONS_PER_TASK = 5  # across every run of the task, approval resumes and retries included
 DAILY_TASK_CAP = 200  # ponytail: flat per-business cap over a rolling 24h; plan-based when outgrown
-DONE, WAITING = "done", "waiting"
+DONE, WAITING, STOPPED = "done", "waiting", "stopped"
+STOPPED_BEFORE = "Not run: the owner stopped the task first."
+# A message the owner sent while the task was running (host.take_messages).
+ADDED = "The owner adds, while you work: {text}"
 THINKING = "thinking"
 
 DELEGATE_SCHEMA = {"type": "function", "function": {
@@ -248,6 +251,17 @@ def assistant_turn(msg: Any) -> dict:
     return turn
 
 
+def reasoning_of(msg: Any) -> str:
+    """The model's thinking on this turn, wherever the provider put it ("" when it had none)."""
+    turn = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else {}
+    found = (turn.get("reasoning_content")
+             or ((turn.get("extra_content") or {}).get("deepseek") or {}).get("reasoning_content")
+             or turn.get("reasoning"))
+    if isinstance(found, dict):
+        found = found.get("content")
+    return found.strip() if isinstance(found, str) else ""
+
+
 def tool_msg(call_id: str, content: str) -> dict:
     return {"role": "tool", "tool_call_id": call_id, "content": content}
 
@@ -352,6 +366,38 @@ async def answer_ask(host, db, child: Any, text: str) -> Optional[Any]:
     return parent
 
 
+async def asked_to_stop(host, task: Any) -> bool:
+    """The owner pressed Stop (host.stop_asked, optional: without it nothing stops a run)."""
+    check = getattr(host, "stop_asked", None)
+    return bool(check is not None and await check(task))
+
+
+async def take_added(host, task: Any) -> list[dict]:
+    """What the owner wrote since the last look, as user turns (host.take_messages, optional)."""
+    take = getattr(host, "take_messages", None)
+    texts = await take(task) if take is not None else []
+    return [{"role": "user", "content": ADDED.format(text=t)} for t in texts]
+
+
+async def stop(host, db, task: Any, history: list, did: list[str]) -> str:
+    """End the run where it is, at the owner's request. What already ran stays done, every
+    call it had not reached is answered as not run, and the chat says what was done."""
+    state = [*history]
+    calls = next((m.get("tool_calls") for m in reversed(state) if isinstance(m, dict)
+                  and m.get("role") == "assistant"), None) or []
+    answered = {m.get("tool_call_id") for m in state if isinstance(m, dict) and m.get("role") == "tool"}
+    state += [tool_msg(c["id"], STOPPED_BEFORE) for c in calls if c.get("id") not in answered]
+    task.state, task.pending, task.status = answer_dangling(state), None, STOPPED
+    reply = getattr(host, "STOPPED_REPLY", "Stopped.")
+    if did:
+        reply += " " + getattr(host, "STOPPED_DID", "Done before that: {did}.").format(did="; ".join(did))
+    host.post_message(db, organization_id=task.organization_id, thread=task.thread,
+                      sender=task.agent_id, body=reply, task_id=task.id)
+    await answer_ask(host, db, task, reply)  # a teammate waiting on this one carries on
+    await db.flush()
+    return STOPPED
+
+
 async def _finish(host, db, task: Any, history: list, text: str, actor: str,
                   shown: list) -> str:
     history.append({"role": "assistant", "content": text})
@@ -433,6 +479,17 @@ LOOK_GONE = "(pictures shown to you earlier)"
 SEES = ("deepseek", "gpt", "claude", "gemini")
 
 
+def with_clock(history: list, note: Optional[str]) -> list:
+    """The request's copy of the history with the time at the top of its first message. Not
+    stored, and fixed for the run, so each round's request starts like the last one did."""
+    if not note:
+        return history
+    first = history[0] if history else None
+    if isinstance(first, dict) and first.get("role") == "user" and isinstance(first.get("content"), str):
+        return [{**first, "content": f"{note}\n\n{first['content']}"}, *history[1:]]
+    return [{"role": "user", "content": note}, *history]
+
+
 def sees_pictures(model: str) -> bool:
     return any(family in (model or "").lower() for family in SEES)
 
@@ -446,7 +503,10 @@ def seen(history: list) -> list:
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list) and any(p.get("type") == "image_url" for p in content
                                              if isinstance(p, dict)):
-            msg = {**msg, "content": LOOK_GONE}
+            # Words that came with the pictures (the owner's message) stay.
+            words = [p.get("text", "") for p in content if isinstance(p, dict)
+                     and p.get("type") == "text" and p.get("text") != LOOK_TEXT]
+            msg = {**msg, "content": "\n\n".join([*words, LOOK_GONE])}
         out.append(msg)
     return out
 
@@ -466,11 +526,45 @@ async def looks(host, images: list, model: str) -> Optional[dict]:
     return {"role": "user", "content": parts} if len(parts) > 1 else None
 
 
+class Usage:
+    """A run's model calls and tokens; `cached` is the part of the input the provider had seen
+    (DeepSeek's prompt cache hits, OpenAI's cached tokens), billed at a fraction."""
+
+    def __init__(self) -> None:
+        self.requests = self.prompt = self.cached = self.completion = 0
+
+    def add(self, resp: Any) -> None:
+        self.requests += 1
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        self.prompt += getattr(u, "prompt_tokens", 0) or 0
+        self.completion += getattr(u, "completion_tokens", 0) or 0
+        details = getattr(u, "prompt_tokens_details", None)
+        self.cached += (getattr(u, "prompt_cache_hit_tokens", 0)
+                        or getattr(details, "cached_tokens", 0) or 0)
+
+
 async def run_task(host, db, task: Any, *, actor: str = "task",
                    llm: Optional[tuple[Any, str]] = None, now: Optional[datetime] = None,
                    channel: Optional[str] = None, budget_seconds: Optional[float] = None) -> str:
     """One run of a task. With `budget_seconds`, a run still working when the time is up
-    checkpoints (status "queued") instead of being cut off mid-tool by its caller's timeout."""
+    checkpoints (status "queued") instead of being cut off mid-tool by its caller's timeout.
+    Logs the run's tokens (`taskwarden_run_usage`) however it ends."""
+    usage = Usage()
+    try:
+        return await _run(host, db, task, usage, actor=actor, llm=llm, now=now, channel=channel,
+                          budget_seconds=budget_seconds)
+    finally:
+        if usage.requests:
+            logger.info("taskwarden_run_usage task_id=%s agent=%s requests=%s prompt=%s "
+                        "cached=%s completion=%s", task.id, task.agent_id, usage.requests,
+                        usage.prompt, usage.cached, usage.completion)
+
+
+async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[tuple[Any, str]],
+               now: Optional[datetime], channel: Optional[str],
+               budget_seconds: Optional[float]) -> str:
     started = time.monotonic()
     now = now or datetime.now(timezone.utc)
     org = task.organization_id
@@ -515,6 +609,8 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
     local_now = now.astimezone(ZoneInfo(ctx.timezone))
     system = {"role": "system", "content": await host.system_prompt(
         db, task, agent, name, teammates, local_now, channel, business_type, self_started, loaded)}
+    clock = getattr(host, "clock", None)
+    note = clock(local_now) if clock else None
     Task = host.Task
     # Work this task already handed to someone counts, so a loop of hand-offs cannot outrun
     # the caps across approval resumes and retries.
@@ -534,7 +630,11 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
     # show from it: posted under its answer, dropped if the run parks instead.
     reads: dict[str, Any] = {}
     shown: list[dict] = []
+    did: list[str] = []  # what this run changed or sent, for the owner if they stop it
     for round_no in range(MAX_ROUNDS):
+        if await asked_to_stop(host, task):
+            return await stop(host, db, task, history, did)
+        history += await take_added(host, task)
         if round_no and too_long(history):
             history = compact(history)
         if round_no and stalled(history, 2) and not any(
@@ -551,10 +651,14 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
             return "queued"
         await host.mark(org, task.thread, agent.id, THINKING)
         resp = await client.chat.completions.create(
-            model=model, extra_body=host.extra_body(model), messages=[system, *history],
+            model=model, extra_body=host.extra_body(model),
+            messages=[system, *with_clock(history if sees_pictures(model) else seen(history), note)],
             tools=tools, tool_choice="auto")
+        usage.add(resp)
         history = seen(history)  # the pictures were seen; they are not kept
         msg = resp.choices[0].message
+        if (think := getattr(host, "thought", None)) is not None and (text := reasoning_of(msg)):
+            await think(org, task.thread, agent.id, text)  # the owner can see why, as it works
         if not msg.tool_calls:
             text = host.clean_text(msg.content)
             if not grounded and not nudged and states_a_figure(text):
@@ -567,6 +671,11 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
                 nudged = True  # one nudge per run, whichever it was
                 history += [{"role": "assistant", "content": text},
                             {"role": "user", "content": UNFINISHED}]
+                task.state = list(history)
+                continue
+            if added := await take_added(host, task):
+                # The owner wrote while this was being written: answer that too, in one reply.
+                history += [{"role": "assistant", "content": text}, *added]
                 task.state = list(history)
                 continue
             return await _finish(host, db, task, history, text, actor, shown)
@@ -710,6 +819,8 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
                                  "args": host.clean_args(args)})
                 continue
             if decision.outcome == gate.ALLOW:
+                if await asked_to_stop(host, task):
+                    return await stop(host, db, task, history, did)
                 await host.mark(org, task.thread, agent.id, tool_name)
                 if sent is not None:
                     # Saved before it runs: a crash mid-send must not lead to a second send.
@@ -727,6 +838,8 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
                 if ok:
                     grounded = True
                 if ok is not False:  # None: stopped at its timeout, it may have gone out
+                    if tool.risk != READ:
+                        did.append(f"{tool_name} ({target})" if target else tool_name)
                     if reach is not None:
                         # Only a send that (maybe) went out counts: a rejected one leaves
                         # the retry open, which is the whole point of retrying.
@@ -746,6 +859,8 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
         task.state, task.contacted = list(history), sorted(sent_task)
         if parked is None and not awaiting:
             await db.commit()  # the round's progress survives a restart
+        if (parked is not None or awaiting) and await asked_to_stop(host, task):
+            return await stop(host, db, task, history, did)
         if parked is not None:
             # A question wins over a batch in the same response: the answer may change what to
             # send. Each held call still needs its tool message; the model proposes it again.
@@ -764,9 +879,12 @@ async def run_task(host, db, task: Any, *, actor: str = "task",
             task.state = list(history)
             return await park(host, db, task, history, batch, name, actor, channel, now)
 
+    if await asked_to_stop(host, task):
+        return await stop(host, db, task, history, did)
     wrap_up = {"role": "user", "content": WRAP_UP}
     resp = await client.chat.completions.create(model=model, extra_body=host.extra_body(model),
-                                                messages=[system, *history, wrap_up])
+                                                messages=[system, *with_clock(history, note), wrap_up])
+    usage.add(resp)
     text = resp.choices[0].message.content or ""
     return await _finish(host, db, task, history, host.clean_text(text) or host.OUT_OF_STEPS,
                          actor, shown)

@@ -13,6 +13,7 @@ import uuid
 import pytest
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -347,3 +348,152 @@ def test_the_shop_example_runs(capsys):
     out = capsys.readouterr().out
     assert "waits: refund {'order_id': 'A7'}" in out
     assert "[lead] Done: I refunded order A8, $19.50." in out
+
+
+# ── A run's tokens are logged, with what the provider had cached ──
+
+def test_usage_counts_deepseek_and_openai_cache_hits():
+    u = loop.Usage()
+    u.add(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1000, completion_tokens=50,
+                                                prompt_cache_hit_tokens=900)))  # DeepSeek
+    u.add(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=800, completion_tokens=20,
+                                                prompt_tokens_details=SimpleNamespace(cached_tokens=640))))  # OpenAI
+    u.add(SimpleNamespace())  # no usage reported
+    assert (u.requests, u.prompt, u.cached, u.completion) == (3, 1800, 1540, 70)
+
+
+async def test_a_run_logs_its_usage_however_it_ends(caplog):
+    host, task = ShopHost(), _task()
+    llm = _llm(Msg(calls=[("read_orders", {})]), Msg("Two orders came in today."))
+    with caplog.at_level("INFO", logger="taskwarden.loop"):
+        assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert any("taskwarden_run_usage" in r.getMessage() and "requests=2" in r.getMessage()
+               for r in caplog.records)
+
+
+class ClockHost(ShopHost):
+    def clock(self, now): return f"It is {now:%H:%M}."
+
+
+async def test_the_clock_tops_every_request_and_is_never_stored_or_in_the_system_prompt():
+    host, task, sent = ClockHost(), _task(), []
+    replies = [Msg(calls=[("read_orders", {})]), Msg("Two orders.")]
+
+    async def create(**kw):
+        sent.append(kw["messages"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=replies.pop(0))])
+    llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    now = datetime(2026, 11, 5, 9, 30, tzinfo=timezone.utc)
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m"), now=now) == "done"
+    assert [m[1]["content"] for m in sent] == ["It is 09:30.\n\nHow are orders today?"] * 2
+    assert all("09:30" not in m[0]["content"] for m in sent)
+    assert task.state[0] == {"role": "user", "content": "How are orders today?"}
+
+
+@dataclass
+class StoppableHost(TextingHost):
+    stop_after: int = 0  # Stop is pressed once this many texts went out
+    texts: int = 0
+
+    async def stop_asked(self, task):
+        return self.texts >= self.stop_after
+
+    async def execute(self, tool, ctx, args):
+        self.texts += tool.name == "send_text"
+        return await super().execute(tool, ctx, args)
+
+
+async def test_a_stop_pressed_before_the_run_ends_it_before_the_model_is_asked():
+    host, task = StoppableHost(stop_after=0), _task()
+    assert await loop.run_task(host, _db(), task, llm=(_llm(), "m")) == "stopped"
+    assert task.status == "stopped" and host.posted[-1]["body"] == "Stopped."
+
+
+async def test_a_stop_mid_round_keeps_what_was_sent_and_runs_nothing_more():
+    host, task = StoppableHost(stop_after=1), _task()
+    host.agent = lambda agent_id: Agent(agent_id, "Lead", tools=("read_orders", "send_text"))
+    llm = _llm(Msg(calls=[("send_text", {"to": "+1555", "body": "Hi"}),
+                          ("send_text", {"to": "+1666", "body": "Hi"})]))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "stopped"
+    assert host.texts == 1
+    assert host.posted[-1]["body"] == "Stopped. Done before that: send_text (+1555)."
+    tool_results = [m["content"] for m in task.state if m.get("role") == "tool"]
+    assert tool_results == ["Sent to +1555.", loop.STOPPED_BEFORE]  # every call answered
+
+
+@dataclass
+class ChattyHost(ShopHost):
+    inbox: list = field(default_factory=list)  # (look number, text): what the owner sends when
+    looks: int = 0
+
+    async def take_messages(self, task):
+        self.looks += 1
+        return [text for at, text in self.inbox if at == self.looks]
+
+
+def _recording(*replies):
+    sent, queue = [], list(replies)
+
+    async def create(**kw):
+        sent.append(kw["messages"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=queue.pop(0))])
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), sent
+
+
+async def test_a_message_sent_mid_run_reaches_the_next_round():
+    host, task = ChattyHost(inbox=[(2, "Only count paid ones.")]), _task()
+    llm, sent = _recording(Msg(calls=[("read_orders", {})]), Msg("One paid order."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert sent[1][-1] == {"role": "user", "content": "The owner adds, while you work: Only count paid ones."}
+    assert host.posted[-1] == {"body": "One paid order."}
+
+
+async def test_a_message_sent_as_the_reply_was_written_gets_one_reply_covering_both():
+    host, task = ChattyHost(inbox=[(2, "And yesterday?")]), _task()
+    llm, sent = _recording(Msg("Two orders today."), Msg("Two today, three yesterday."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert [m["content"] for m in sent[1][-2:]] == [
+        "Two orders today.", "The owner adds, while you work: And yesterday?"]
+    assert [p["body"] for p in host.posted] == ["Two today, three yesterday."]
+
+
+class Thinking(Msg):
+    def __init__(self, reasoning, **kw):
+        super().__init__(**kw)
+        self.reasoning = reasoning
+
+    def model_dump(self, exclude_none=False):
+        return {**super().model_dump(exclude_none), "reasoning_content": self.reasoning}
+
+
+@dataclass
+class ThinkingHost(ShopHost):
+    thoughts: list = field(default_factory=list)
+
+    async def thought(self, org, thread, agent_id, text):
+        self.thoughts.append((agent_id, text))
+
+
+async def test_the_models_thinking_is_handed_to_the_host_as_it_works():
+    host, task = ThinkingHost(), _task()
+    llm = _llm(Thinking("Read the orders first.", calls=[("read_orders", {})]), Msg("Two orders."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert host.thoughts == [("lead", "Read the orders first.")]  # a turn with none says nothing
+
+
+def test_a_picture_seen_once_leaves_the_words_it_came_with():
+    owner = {"role": "user", "content": [{"type": "text", "text": "Post this photo"},
+                                         {"type": "image_url", "image_url": {"url": "data:x"}}]}
+    assert loop.seen([owner]) == [{"role": "user", "content": f"Post this photo\n\n{loop.LOOK_GONE}"}]
+    look = {"role": "user", "content": [{"type": "text", "text": loop.LOOK_TEXT},
+                                        {"type": "image_url", "image_url": {"url": "data:x"}}]}
+    assert loop.seen([look]) == [{"role": "user", "content": loop.LOOK_GONE}]
+
+
+async def test_a_model_that_cant_see_is_never_sent_a_picture():
+    host, task = ShopHost(), _task()
+    task.state = [{"role": "user", "content": [{"type": "text", "text": "What is this?"},
+                                               {"type": "image_url", "image_url": {"url": "data:x"}}]}]
+    llm, sent = _recording(Msg("A receipt."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "llama-3")) == "done"
+    assert "image_url" not in json.dumps(sent[0])

@@ -33,7 +33,7 @@ OWNER_ORIGIN = "owner"
 
 
 async def retry_or_fail(host, db, task: Any) -> None:
-    if task.status in ("waiting", "done"):
+    if task.status in ("waiting", "done", "stopped"):
         return  # the run parked or finished before failing; its committed state stands
     if (task.attempts or 0) >= MAX_ATTEMPTS:
         task.status, task.pending = "failed", None

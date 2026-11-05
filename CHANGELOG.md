@@ -1,0 +1,23 @@
+# Changelog
+
+## 0.2.0 (2026-11-04)
+
+New optional host hooks; a host without them behaves as in 0.1.0.
+
+- `clock(now)`: the time rides on the first message of each request instead of the system
+  prompt, so the prompt stays in the model's cache across runs. `BaseHost` gives a UTC line.
+- `stop_asked(task)`: the owner's Stop. Checked before each model call, each tool and before
+  parking; the run ends as `stopped`, answers every call it never reached, and posts what it
+  had already done (`STOPPED_REPLY`, `STOPPED_DID`).
+- `take_messages(task)`: what the owner writes while a task runs joins it, at the next round
+  and again before the run finishes, so one reply covers both.
+- `thought(org, thread, agent, text)`: the model's reasoning on each turn, for a live "why".
+- `decisions.apply(..., shown=)`: how the chat shows an answer when it differs from what the
+  agent reads.
+- Pictures in a user message (an owner's photo) are shown once and their words kept; a model
+  that can't see pictures is sent the words only.
+- `Usage`: each run logs its model calls and tokens, cached ones included (DeepSeek, OpenAI).
+
+## 0.1.0 (2026-11-04)
+
+First release.
