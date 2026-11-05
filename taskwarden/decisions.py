@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from sqlalchemy import select, update
 
+from . import gate
 from .loop import MAYBE_SENT, pending_calls, tool_msg
 
 # What a parked call reads when the owner wrote in the chat instead of approving it.
@@ -19,6 +20,8 @@ REVISE_RESULT = ("Not done yet: the owner replied instead of approving: \"{chang
                  "something else, do that, and ask for this action again only if it still makes sense.")
 # A parked call whose tool no longer exists when the owner decides.
 GONE = "Not run: this action no longer exists. Say what you meant to do another way."
+# A parked call the agent may no longer make (paused, or the tool taken away while it waited).
+NOT_ALLOWED = "Not run: the owner approved it, but you may no longer do this. Say so in your report."
 # What the model reads before the result of a call the owner edited, so its report names
 # what really went out.
 EDITED = "The owner changed {fields} before approving, and it ran as changed. "
@@ -112,12 +115,27 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
         ctx, company = await host.context(db, organization_id)
         region = host.region(company)
         sent = set(task.contacted or [])
+        # Checked again now, on what will really run: the call may have waited days, and the
+        # owner's edits never went through the check made when it was parked.
+        agent = host.for_business(host.agent(task.agent_id), company.get("business_type"))
+        state = (await host.agent_states(db, organization_id)).get(agent.id, host.default_state())
     for call, run, changed in zip(calls, runs, changes):
         tool = host.tools.get(call["tool"])
         if tool is None:  # renamed or removed while it waited for the owner
             results.append(tool_msg(call.get("tool_call_id", ""), GONE))
             continue
         if run:
+            refusal, rule = None, None
+            if host.decide(agent, tool, state, self_started=False).outcome == gate.DENY:
+                refusal, rule = NOT_ALLOWED, "no_longer_allowed"
+            elif tool.check is not None:
+                refusal, rule = await host.precheck(tool, ctx, call.get("args") or {}), "precheck"
+            if refusal:
+                host.audit(db, organization_id=organization_id, agent_id=task.agent_id,
+                           tool=call["tool"], risk=tool.risk, decision="deny", rule=rule,
+                           task_id=task.id, actor="owner")
+                results.append(tool_msg(call.get("tool_call_id", ""), refusal))
+                continue
             key = host.sent_key(call["tool"], call.get("args") or {}, region)
             if key is not None:
                 # Saved before it runs, as in the loop: a crash mid-send must not lead to a

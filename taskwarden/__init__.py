@@ -6,4 +6,4 @@ call), decisions (the owner's approve / edit / decline), sweeper (background run
 columns), host (what the app supplies). See README.md.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

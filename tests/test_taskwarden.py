@@ -297,6 +297,36 @@ async def test_an_edited_approval_runs_as_edited_and_the_agent_is_told():
     assert json.loads(host.posted[-1]["body"])["calls"][0]["args"] == {"order_id": "A8"}
 
 
+async def _park_refund(host):
+    task, db = _task(), _db()
+    assert await loop.run_task(host, db, task, llm=(_llm(Msg(calls=[("refund", {"order_id": "A7"})])), "m")) == "waiting"
+    db.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: task))
+    host.execute = AsyncMock(side_effect=AssertionError("must not run"))
+    host.audit = MagicMock()
+    return task, db
+
+
+async def test_an_approval_is_checked_again_on_the_args_the_owner_edited():
+    host = ShopHost()
+    host.tools["refund"] = replace(host.tools["refund"], check=AsyncMock())
+    host.precheck = AsyncMock(side_effect=lambda tool, ctx, args:
+                              "Order A8 was already refunded." if args["order_id"] == "A8" else None)
+    task, db = await _park_refund(host)
+    await decisions.apply(host, db, "shop1", task, "approve", edited_args={"c0": {"order_id": "A8"}})
+    assert {"role": "tool", "tool_call_id": "c0", "content": "Order A8 was already refunded."} in task.state
+    assert host.audit.call_args.kwargs["rule"] == "precheck"
+
+
+async def test_an_approval_for_an_agent_paused_while_it_waited_does_not_run():
+    host = ShopHost()
+    task, db = await _park_refund(host)
+    host.agent_states = AsyncMock(return_value={"lead": gate.AgentState(paused=True)})
+    await decisions.apply(host, db, "shop1", task, "approve")
+    assert {"role": "tool", "tool_call_id": "c0", "content": decisions.NOT_ALLOWED} in task.state
+    assert host.audit.call_args.kwargs["rule"] == "no_longer_allowed"
+    assert task.status == "queued"  # the agent reads why and reports
+
+
 # ── A long run sheds its old tool results before it is made to wrap up ──
 
 def test_old_results_are_cut_to_their_opening_and_the_latest_stay_whole():

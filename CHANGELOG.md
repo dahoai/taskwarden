@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 (2026-11-04)
+
+- An approved call is checked again before it runs, on what will really run: the gate (an
+  agent paused or a tool taken away while it waited gets `NOT_ALLOWED`, audited as
+  `no_longer_allowed`) and the tool's own `check`, on the owner's edits too (audited as
+  `precheck`). Before, only the tool's existence was checked at approval time.
+
 ## 0.2.0 (2026-11-04)
 
 New optional host hooks; a host without them behaves as in 0.1.0.
