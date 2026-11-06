@@ -30,6 +30,7 @@ around the questions that come up then:
 | A long task overflows the model's context | Old tool results are **compacted** before the run is made to wrap up. |
 | The model repeats the same call | It is **reminded once**, then stopped. |
 | A customer writes back | Their reply **wakes the task** that wrote to them. |
+| Agents poll "anything new?" all day | **One clock, many triggers**: an agent wakes on a schedule, on an event your app fires (an email to an alias, a webhook), or when a teammate finishes, with their report. Nothing a trigger starts can send, pay or change records without the owner. |
 | One busy business floods the queue | The background **sweeper** runs owner work first, then takes turns between businesses, several at once, under a Redis lock. |
 | "Who did what?" | Every call is **audited** with its decision and the rule behind it. |
 
@@ -57,6 +58,7 @@ owner request ──▶ loop.run_task ──▶ model ──▶ tool call ──
 | `decisions` | The owner's approve / edit / decline / revise / answer on a parked task, claimed exactly once. |
 | `sweeper` | Background runs: queued tasks, retries, stale runs recovered, old waits expired. |
 | `replies` | A reply from someone the team wrote to wakes that task. |
+| `triggers` | What wakes an agent besides the owner: `schedule`, `event`, `done` (a teammate finished). Routines an agent sets up itself, with the owner's click (`routine_tool`). |
 | `folders` | Agents as folders: `AGENT.md` plus `skills/<name>/SKILL.md`, loaded on demand. |
 | `models` | SQLAlchemy column mixins for your two tables (tasks, messages). |
 | `host` | What your app supplies, and `BaseHost` with a default for everything that has one. |
@@ -120,6 +122,48 @@ await sweeper.sweep(host, Session, redis, now=now, run=run) # on a timer: resume
 email the owner), `refuse_run` (credits), `context` (the business's time zone), `audit`
 (store the trail), `mark` (live progress), `thought` (the model's reasoning, as it works), `take_messages` (what the owner writes while a task runs joins it), `stop_asked` (the owner's Stop: the run ends at its next step and says what it did), `clock` (how the time reads; it rides on the
 first message of each request, never in the system prompt, so the prompt stays cached).
+
+## One clock, many triggers
+
+An agent says in its `AGENT.md` what wakes it (`when:`, not `on:`, which YAML reads as true):
+
+```yaml
+triggers:
+  - when: schedule          # Mondays at 09:00, the business's local time
+    cadence: weekly
+    weekday: 0
+    at: "09:00"
+    goal: Find what people kept asking for this week.
+  - when: done              # Scout finished: its report comes with the goal
+    after: scout
+    goal: Collect the complaints behind Scout's top three.
+  - when: event             # your app calls triggers.fire(host, db, org, "email:bugs", body)
+    event: email:bugs
+    goal: A bug report came in. Write the steps to reproduce it.
+```
+
+```python
+class MyHost(BaseHost):
+    triggers = triggers.of_folders(folders)        # checked: agents exist, no done-loop
+
+await triggers.fire(host, db, org, "email:bugs", email_text)  # your webhook handler
+await triggers.due(host, db, org, now=now)                    # in the sweeper's on_sweep
+# `done` triggers need nothing: a finished task starts whoever follows its agent.
+```
+
+Every task a trigger starts is self-started, so an email can wake an agent but cannot make it
+send, pay or change records without the owner's click; one woken by an event or a report asks
+even before `routine` work (a text back, a booking), since a stranger's words may be steering it. The same goal is queued once a day (a
+retried webhook), each agent runs at most `max_per_day` triggered tasks, a paused agent stays
+asleep, and a `done` chain that would loop is refused when it is loaded.
+
+Agents can set up their own routines: give one `triggers.routine_tool(host, save)` and write
+`custom_triggers(db, org)` to read back what `save` stored. Adding a routine is a `profile`
+call, so it always waits for the owner's click.
+
+[`examples/launch_team.py`](examples/launch_team.py) runs a five-agent launch team offline:
+Scout on Mondays, Pain Miner and Judge on each other's reports, Inbox on email, and a routine
+Chief sets up once the owner approves.
 
 ## Risk levels
 

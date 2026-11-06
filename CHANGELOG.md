@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 (2026-11-05)
+
+New and optional; a host without triggers behaves as in 0.2.1.
+
+- `triggers`: what wakes an agent besides the owner. In `AGENT.md`, `triggers:` with
+  `when: schedule` (daily or weekly, optional local `at`), `when: event` (a name the app fires
+  with `triggers.fire`), or `when: done` (`after:` a teammate; its report comes with the goal).
+  `triggers.due` queues the schedules due for one business (once a local day, one retry after
+  a failure, never on top of a run still open). Tasks they start have origin `schedule` or
+  `trigger` and are always self-started. A task an event or a report woke (and its hand-offs)
+  also asks before a `routine` call: a stranger's email can't make it text anyone. Guards: no
+  `done` loop (checked at load, on add and at run time), the same event once a day,
+  `max_per_day` per agent, 100 triggered tasks a day per business, paused agents stay asleep.
+- `triggers.routine_tool(host, save, events=)`: agents set up routines; always the owner's
+  click (`profile` risk), checked before the card is shown. `custom_triggers(db, org)` on the
+  host reads them back.
+- A task a trigger started counts its goal (the report, the email) as read, so stating its
+  figures is not taken for invented ones.
+- `examples/launch_team.py`: a five-agent team on one clock, offline.
+
 ## 0.2.1 (2026-11-04)
 
 - An approved call is checked again before it runs, on what will really run: the gate (an

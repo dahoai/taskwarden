@@ -16,8 +16,10 @@ from typing import Optional
 
 import yaml
 
+from .triggers import parse as parse_trigger
+
 _AGENT_KEYS = {"id", "name", "title", "aliases", "business_types", "tools", "skills", "agenda",
-               "skills_on_demand"}
+               "skills_on_demand", "triggers"}
 _SKILL_KEYS = {"name", "description", "tools", "requires", "evals"}
 _AGENDA_KEYS = {"cadence", "weekday", "goal", "skills"}
 
@@ -51,6 +53,9 @@ class AgentFolder:
     # Step 2: the prompt lists the skills and use_skill loads one. Off: every skill is in
     # the role (step 1). Switched on per agent, only when its evals hold.
     on_demand: bool = False
+    # What wakes this agent besides the owner (taskwarden.triggers): checked across the whole
+    # team by triggers.of_folders, since a `done` chain spans agents.
+    triggers: tuple = ()
 
     @property
     def role(self) -> str:
@@ -142,6 +147,13 @@ def load_agent(folder: Path, groups: tuple[str, ...] = ()) -> AgentFolder:
         raise ValueError(f"{path}: agenda has cadence, goal and optionally weekday and skills")
     if unknown := set((agenda or {}).get("skills") or []) - {s.name for s in skills}:
         raise ValueError(f"{path}: agenda preloads unknown skills {sorted(unknown)}")
+    raw_triggers = meta.get("triggers") or []
+    if not isinstance(raw_triggers, list):
+        raise ValueError(f"{path}: triggers is a list")
+    try:
+        triggers = tuple(parse_trigger(meta["id"], t) for t in raw_triggers)
+    except ValueError as e:
+        raise ValueError(f"{path}: {e}") from None
     types = meta.get("business_types")
     if isinstance(types, str) and types not in groups:
         raise ValueError(f"{path}: business_types is a list, null or one of {groups}")
@@ -151,4 +163,4 @@ def load_agent(folder: Path, groups: tuple[str, ...] = ()) -> AgentFolder:
         aliases=_names(path, meta, "aliases"),
         business_types=tuple(types) if isinstance(types, list) else types,
         agenda={**agenda, "goal": " ".join(agenda["goal"].split())} if agenda else None,
-        on_demand=bool(meta.get("skills_on_demand")))
+        on_demand=bool(meta.get("skills_on_demand")), triggers=triggers)

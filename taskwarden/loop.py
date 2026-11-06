@@ -22,9 +22,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
-from . import gate
+from . import gate, triggers
 from .folders import USE_SKILL
-from .tools import READ, capture_looks
+from .tools import READ, ROUTINE, capture_looks
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +403,12 @@ async def _finish(host, db, task: Any, history: list, text: str, actor: str,
     history.append({"role": "assistant", "content": text})
     task.state, task.pending, task.status = history, None, DONE
     await host.finish(db, task, text or "Done.", list(shown), actor)
+    if triggers.used_by(host):  # whoever waits on this agent's work starts now
+        try:  # in a savepoint: a failure there never undoes the finished task
+            async with db.begin_nested():
+                await triggers.follow(host, db, task, text)
+        except Exception:  # noqa: BLE001
+            logger.exception("taskwarden_follow_failed task_id=%s", task.id)
     return DONE
 
 
@@ -573,7 +579,9 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
         task.status = "failed"
         await db.commit()
         return task.status
-    self_started = host.self_started(task)
+    # A trigger's task is never the owner's, whatever the host counts as self-started.
+    triggered = task.origin in (triggers.SCHEDULED, triggers.TRIGGERED)
+    self_started = host.self_started(task) or triggered
     ctx, company = await host.context(db, org)
     ctx.self_started = self_started
     states = await host.agent_states(db, org)
@@ -621,7 +629,10 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
         Task.created_at >= now - timedelta(days=1)))).scalar() or 0
 
     # Did a tool actually run this turn (or hand this resumed run a result), and was it asked to go read.
-    grounded, nudged = fresh_results(history), False
+    # A task a trigger started was handed its facts (a teammate's report, an email) in its goal.
+    grounded = fresh_results(history) or (task.origin == triggers.TRIGGERED
+                                          and task.parent_id is None and len(history) == 1)
+    nudged = False
     # What this task has already sent, in every run of it: seeded from the row so a
     # park-and-resume cannot send the same person the same thing again.
     region = host.region(company)
@@ -773,6 +784,11 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                 continue
             tool = host.tools.get(tool_name)
             decision = host.decide(agent, tool, state, self_started=self_started)
+            if (decision.outcome == gate.ALLOW and task.origin == triggers.TRIGGERED
+                    and tool is not None and tool.risk == ROUTINE):
+                # Woken by an email or a teammate's report: words from outside may be steering
+                # it, so even routine work that reaches people waits for the owner.
+                decision = gate.Decision(gate.ASK, "triggered_needs_owner")
             target = next((str(args[k])[:320] for k in ("to", "phone_number", "contact_info")
                            if isinstance(args, dict) and args.get(k)), None)
             host.audit(db, organization_id=org, agent_id=agent.id, tool=tool_name,

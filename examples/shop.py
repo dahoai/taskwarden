@@ -11,7 +11,6 @@ and use Postgres in production.
 """
 import asyncio
 import json
-import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional
