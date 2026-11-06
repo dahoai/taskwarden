@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 (2026-11-06)
+
+- Outside words are fenced: what `fire` and `follow` put under a goal is marked line by line
+  between two lines carrying its SHA-256 fingerprint, cut at 16,000 characters
+  (`triggers.fenced`, for any other outside text). Goals of triggered tasks read differently.
+- `watch: true` on a trigger: its tasks (origin `watch`) get their agent's `read` tools only,
+  anything else is refused in code, no hand-offs or questions; a reply of `NOTHING_TO_REPORT`
+  finishes without a message and wakes nobody. `routine_tool` takes `watch` too.
+- A daily token budget per agent: `DAILY_TOKENS` on the host, or `token_budget(db, task)`.
+  New column `tokens` on `TaskColumns` (an existing table: `ALTER TABLE ... ADD COLUMN tokens
+  integer NOT NULL DEFAULT 0`); without a budget nothing reads it.
+- SECURITY.md: what is enforced, what is a convention, what is the host's.
+
 ## 0.4.0 (2026-11-06)
 
 `triggers.due` carries a host's own scheduled work (Perbene's standing agenda runs on it).

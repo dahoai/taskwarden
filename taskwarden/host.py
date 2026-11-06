@@ -40,6 +40,9 @@ class Host(Protocol):
         facts the host itself reads back: business_type, country)."""
     async def agent_states(self, db: Any, organization_id: str) -> dict[str, AgentState]: ...
     def default_state(self) -> AgentState: ...
+    async def token_budget(self, db: Any, task: Any) -> Optional[int]:
+        """Tokens this task's agent may use in a day, or None for no cap. Optional; needs the
+        `tokens` column on Task. Past it, the run stops and the chat says so (OVER_BUDGET)."""
     async def llm(self, db: Any, organization_id: str) -> tuple[Any, str]:
         """(an OpenAI-compatible async client, model name)."""
     def extra_body(self, model: str) -> Optional[dict]: ...
@@ -116,6 +119,10 @@ class Host(Protocol):
     NEVER_WAITS_REFUSED: str
     NEVER_WAITS_NEEDS_OWNER: str
     OUT_OF_STEPS: str
+    # Optional, defaults in taskwarden.loop: under a watch task's goal, its refusal, the budget.
+    WATCHING: str
+    WATCH_REFUSED: str
+    OVER_BUDGET: str  # {name} {limit}
 
 
 class BaseHost:
@@ -137,6 +144,7 @@ class BaseHost:
     NEVER_WAITS_NEEDS_OWNER = ("Not done: this needs the owner, and this task can't wait for "
                                "them. Put it in your report.")
     OUT_OF_STEPS = "I ran out of steps before finishing. Ask me to carry on."
+    DAILY_TOKENS: Optional[int] = None  # each agent's daily token budget; None = no cap
     STOPPED_REPLY = "Stopped."
     STOPPED_DID = "Done before that: {did}."
 
@@ -182,6 +190,9 @@ class BaseHost:
 
     def default_state(self) -> AgentState:
         return AgentState()
+
+    async def token_budget(self, db, task) -> Optional[int]:
+        return self.DAILY_TOKENS  # per agent and business: override to vary it
 
     def extra_body(self, model: str) -> Optional[dict]:
         return None

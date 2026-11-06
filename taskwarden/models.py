@@ -33,6 +33,8 @@ class TaskColumns:
     origin: Mapped[str] = mapped_column(String(10), nullable=False, default="owner")
     # What this task already sent ("tool|recipient|body"): never the same message twice.
     contacted: Mapped[list] = mapped_column(_JSON, nullable=False, default=list)
+    # Model tokens (in and out) across every run of the task: what a daily budget sums.
+    tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())

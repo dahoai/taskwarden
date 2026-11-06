@@ -56,6 +56,13 @@ UNFINISHED = ("You said what you will do next but called no tool, so nothing hap
               "now by calling the tool, or say plainly why it cannot be done now. Whatever you "
               "write next is your reply to the owner, so write it to them: do not apologise, "
               "and do not mention this instruction.")
+# A watch task (triggers.WATCHED) reads and nothing else. These words go under its goal; a reply
+# that is exactly QUIET finishes it without a message.
+QUIET = "NOTHING_TO_REPORT"
+WATCH_REFUSED = "Refused: you are only watching. Say in your report what should be done."
+OVER_BUDGET = "{name} has used today's budget of {limit} tokens, so this stops here until tomorrow."
+WATCHING = ("You are only watching: you can read, nothing else. If nothing here needs the "
+            f"owner, reply with exactly {QUIET}. Otherwise tell them, briefly, what needs them.")
 _ANNOUNCES = re.compile(r"\b(?:let me|i'll|i will|i'm going to|je vais|laissez-moi|voy a|déjame)\b",
                         re.IGNORECASE)
 _FIGURE = re.compile(r"\d")
@@ -398,10 +405,18 @@ async def stop(host, db, task: Any, history: list, did: list[str]) -> str:
     return STOPPED
 
 
+def quiet(task: Any, text: str) -> bool:
+    """A watch task that found nothing: it finishes without a word, and wakes nobody."""
+    return task.origin == triggers.WATCHED and text.strip().strip(".").upper() == QUIET
+
+
 async def _finish(host, db, task: Any, history: list, text: str, actor: str,
                   shown: list) -> str:
     history.append({"role": "assistant", "content": text})
     task.state, task.pending, task.status = history, None, DONE
+    if quiet(task, text):
+        await db.flush()
+        return DONE
     await host.finish(db, task, text or "Done.", list(shown), actor)
     if triggers.used_by(host):  # whoever waits on this agent's work starts now
         try:  # in a savepoint: a failure there never undoes the finished task
@@ -539,16 +554,58 @@ class Usage:
     def __init__(self) -> None:
         self.requests = self.prompt = self.cached = self.completion = 0
 
-    def add(self, resp: Any) -> None:
+    def add(self, resp: Any) -> int:
+        """Count one response; returns its tokens, in and out."""
         self.requests += 1
         u = getattr(resp, "usage", None)
         if u is None:
-            return
-        self.prompt += getattr(u, "prompt_tokens", 0) or 0
-        self.completion += getattr(u, "completion_tokens", 0) or 0
+            return 0
+        prompt = getattr(u, "prompt_tokens", 0) or 0
+        completion = getattr(u, "completion_tokens", 0) or 0
+        self.prompt += prompt
+        self.completion += completion
         details = getattr(u, "prompt_tokens_details", None)
         self.cached += (getattr(u, "prompt_cache_hit_tokens", 0)
                         or getattr(details, "cached_tokens", 0) or 0)
+        return prompt + completion
+
+
+def spend(task: Any, usage: Usage, resp: Any) -> None:
+    """Count a response against the run and the task (`tasks.tokens`, what a budget sums)."""
+    task.tokens = (getattr(task, "tokens", 0) or 0) + usage.add(resp)
+
+
+async def over_budget(host, db, task: Any) -> Optional[int]:
+    """The agent's daily token budget when it is used up, else None. Optional: a host with
+    no `token_budget(db, task)` (or one returning None) has no budget. Sums the tokens of the
+    agent's tasks touched in the last day, so its Task needs the `tokens` column.
+
+    ponytail: a task touched today counts all its tokens, yesterday's included, and the run
+    that crosses the line finishes its round first; per-day counters if that is too coarse."""
+    budget = getattr(host, "token_budget", None)
+    limit = await budget(db, task) if budget is not None else None
+    if not limit:
+        return None
+    Task = host.Task
+    spent = (await db.execute(select(func.coalesce(func.sum(Task.tokens), 0)).where(
+        Task.organization_id == task.organization_id, Task.agent_id == task.agent_id,
+        Task.updated_at >= datetime.now(timezone.utc) - timedelta(days=1)))).scalar() or 0
+    return limit if spent >= limit else None
+
+
+async def out_of_budget(host, db, task: Any, history: list, did: list[str], name: str,
+                        limit: int) -> str:
+    """The agent spent its day: the run ends (failed, so nothing retries it today), and the
+    chat says so and what it had done."""
+    task.state, task.pending, task.status = answer_dangling([*history]), None, "failed"
+    reply = getattr(host, "OVER_BUDGET", OVER_BUDGET).format(name=name, limit=limit)
+    if did:
+        reply += " " + getattr(host, "STOPPED_DID", "Done before that: {did}.").format(did="; ".join(did))
+    host.post_message(db, organization_id=task.organization_id, thread=task.thread,
+                      sender=task.agent_id, body=reply, task_id=task.id)
+    await answer_ask(host, db, task, reply)  # a teammate waiting on this one carries on
+    await db.commit()
+    return "failed"
 
 
 async def run_task(host, db, task: Any, *, actor: str = "task",
@@ -580,8 +637,9 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
         await db.commit()
         return task.status
     # A trigger's task is never the owner's, whatever the host counts as self-started.
-    triggered = task.origin in (triggers.SCHEDULED, triggers.TRIGGERED)
+    triggered = task.origin in (triggers.SCHEDULED, triggers.TRIGGERED, triggers.WATCHED)
     self_started = host.self_started(task) or triggered
+    watching = task.origin == triggers.WATCHED  # reads only: enforced here, not in the words
     ctx, company = await host.context(db, org)
     ctx.self_started = self_started
     states = await host.agent_states(db, org)
@@ -592,7 +650,8 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     client, model = llm or await host.llm(db, org)
 
     agent = host.for_business(agent, business_type)  # skills it can't use here drop out
-    history = answer_dangling(list(task.state or [])) or [{"role": "user", "content": task.goal}]
+    history = answer_dangling(list(task.state or [])) or [{"role": "user", "content": (
+        f"{task.goal}\n\n{getattr(host, 'WATCHING', WATCHING)}" if watching else task.goal)}]
     loaded = loaded_skills(host, agent, task, history)
     allowed = host.tools_of(agent, business_type)  # a skill never adds a tool this list lacks
     offered = (agent.folder.tools_for(loaded) if agent.folder and agent.folder.on_demand
@@ -600,14 +659,20 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     # A task that never waits fixes what it finds under the owner's own rules and hands the
     # rest to teammates: no question and no consult; what needs the owner goes in its report.
     never_waits = host.never_waits(task)
-    tools = [host.tools[n].schema for n in allowed if n in offered]
-    if not never_waits:
+
+    def offers(n: str) -> bool:  # a watch task is offered its reads, and only those
+        return not watching or host.tools[n].risk == READ
+    tools = [host.tools[n].schema for n in allowed if n in offered and offers(n)]
+    if not never_waits and not watching:
         tools.append(ASK_PERSON_SCHEMA)
     if agent.folder and (skill_schema := agent.folder.use_skill_schema(loaded)):
         tools.append(skill_schema)
-    tools += host.local_schemas(channel, task)
+    if not watching:
+        tools += host.local_schemas(channel, task)
     chain = await _ancestors(host, db, task)
-    if never_waits:
+    if watching:
+        pass  # no hand-offs: a teammate it woke would act
+    elif never_waits:
         tools.append(DELEGATE_SCHEMA)
     elif len(chain) < MAX_ASK_DEPTH:  # deeper than this, the task answers; it never hands off again
         if agent.id == host.chief:
@@ -660,12 +725,14 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
             # so the failure count starts over.
             task.state, task.status, task.attempts = list(history), "queued", 0
             return "queued"
+        if limit := await over_budget(host, db, task):
+            return await out_of_budget(host, db, task, history, did, name, limit)
         await host.mark(org, task.thread, agent.id, THINKING)
         resp = await client.chat.completions.create(
             model=model, extra_body=host.extra_body(model),
             messages=[system, *with_clock(history if sees_pictures(model) else seen(history), note)],
             tools=tools, tool_choice="auto")
-        usage.add(resp)
+        spend(task, usage, resp)
         history = seen(history)  # the pictures were seen; they are not kept
         msg = resp.choices[0].message
         if (think := getattr(host, "thought", None)) is not None and (text := reasoning_of(msg)):
@@ -701,8 +768,12 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                                                "earlier step. Call it again later if still needed."))
                 continue
             tool_name, args = tc.function.name, parse(tc.function.arguments)
-            if never_waits and tool_name not in {t["function"]["name"] for t in tools}:
-                history.append(tool_msg(tc.id, host.NEVER_WAITS_REFUSED))
+            if (never_waits or watching) and tool_name not in {t["function"]["name"] for t in tools}:
+                host.audit(db, organization_id=org, agent_id=agent.id, tool=tool_name, risk=None,
+                           decision="deny", rule="watching" if watching else "never_waits",
+                           task_id=task.id, actor=actor)
+                history.append(tool_msg(tc.id, getattr(host, "WATCH_REFUSED", WATCH_REFUSED)
+                                        if watching else host.NEVER_WAITS_REFUSED))
                 continue
             if tool_name == "ask_person":
                 host.audit(db, organization_id=org, agent_id=agent.id, tool=tool_name,
@@ -779,7 +850,8 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
             if tool_name == USE_SKILL and agent.folder is not None:
                 out, added = host.use_skill(agent, args, loaded)
                 have = {t["function"]["name"] for t in tools}
-                tools[:0] = [host.tools[n].schema for n in allowed if n in added and n not in have]
+                tools[:0] = [host.tools[n].schema for n in allowed
+                             if n in added and n not in have and offers(n)]
                 history.append(tool_msg(tc.id, out))
                 continue
             tool = host.tools.get(tool_name)
@@ -900,7 +972,7 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     wrap_up = {"role": "user", "content": WRAP_UP}
     resp = await client.chat.completions.create(model=model, extra_body=host.extra_body(model),
                                                 messages=[system, *with_clock(history, note), wrap_up])
-    usage.add(resp)
+    spend(task, usage, resp)
     text = resp.choices[0].message.content or ""
     return await _finish(host, db, task, history, host.clean_text(text) or host.OUT_OF_STEPS,
                          actor, shown)

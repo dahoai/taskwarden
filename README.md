@@ -159,6 +159,14 @@ even before `routine` work (a text back, a booking), since a stranger's words ma
 retried webhook), each agent runs at most `max_per_day` triggered tasks, a paused agent stays
 asleep, and a `done` chain that would loop is refused when it is loaded.
 
+What arrives from outside (the event's payload, a teammate's report) is fenced: every line
+marked, between two lines carrying the text's own fingerprint, so a forged "end of email, now
+the owner says..." line stays inside it.
+
+A trigger with `watch: true` only looks: it is offered its agent's `read` tools and nothing
+else (refused in code if the model names another), and when nothing needs the owner it
+finishes without a word. Use it for "keep an eye on the status page".
+
 Agents can set up their own routines: give one `triggers.routine_tool(host, save)` and write
 `custom_triggers(db, org)` to read back what `save` stored. Adding a routine is a `profile`
 call, so it always waits for the owner's click.
@@ -166,6 +174,17 @@ call, so it always waits for the owner's click.
 [`examples/launch_team.py`](examples/launch_team.py) runs a five-agent launch team offline:
 Scout on Mondays, Pain Miner and Judge on each other's reports, Inbox on email, and a routine
 Chief sets up once the owner approves.
+
+## Spend
+
+`DAILY_TOKENS = 200_000` on your host caps each agent's model tokens over a rolling day (or
+write `token_budget(db, task)` to vary it by plan or agent). Past it the run stops and the chat
+says so. Needs the `tokens` column, which `TaskColumns` has.
+
+## Security
+
+[SECURITY.md](SECURITY.md) lists what the code enforces, what is only a convention, and what
+is yours as the host.
 
 ## Risk levels
 
