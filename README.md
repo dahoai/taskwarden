@@ -148,6 +148,8 @@ class MyHost(BaseHost):
 
 await triggers.fire(host, db, org, "email:bugs", email_text)  # your webhook handler
 await triggers.due(host, db, org, now=now)                    # in the sweeper's on_sweep
+# due(..., origin="agenda", goal=todays_words): your own origin name, and the day's words
+# (or None to skip today), asked only for a run that is otherwise due.
 # `done` triggers need nothing: a finished task starts whoever follows its agent.
 ```
 

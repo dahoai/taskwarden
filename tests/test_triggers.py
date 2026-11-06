@@ -273,3 +273,74 @@ async def test_a_loop_closed_by_two_routines_starts_nothing_and_never_breaks_the
             raise RuntimeError("store down")
         host.custom_triggers = broken
         assert await loop.run_task(host, db, task) == "done"
+
+
+# ── A host's own scheduled work (Perbene's standing agenda runs on this) ──
+
+def _row(agent, status, origin="schedule", goal="Scan", at=MONDAY):
+    return Task(id=uuid.uuid4(), organization_id="org", agent_id=agent, thread=agent, goal=goal,
+                status=status, origin=origin, state=[], contacted=[], attempts=0,
+                created_at=at.astimezone(timezone.utc))
+
+
+@pytest.mark.parametrize("today, due", [
+    ([], True),
+    ([("queued", "schedule")], False),
+    ([("waiting", "schedule")], False),
+    ([("done", "schedule")], False),
+    ([("failed", "schedule")], True),                        # one failure gets a retry
+    ([("failed", "schedule"), ("failed", "schedule")], False),
+    ([("queued", "owner")], False),                          # the agent is already busy
+    ([("done", "owner")], True),                             # it was, and finished
+])
+async def test_what_a_schedule_waits_for(Session, today, due):
+    host = Host(triggers=(T("scout", when="schedule", goal="Scan"),))
+    async with Session() as db:
+        for status, origin in today:
+            db.add(_row("scout", status, origin, at=MONDAY - timedelta(minutes=30)))
+        await db.flush()
+        assert bool(await triggers.due(host, db, "org", now=MONDAY)) is due
+
+
+async def test_a_host_names_its_origin_and_writes_the_days_goal(Session):
+    host = Host(triggers=(T("scout", when="schedule", goal="Scan"),
+                          T("miner", when="schedule", goal="Mine")))
+    asked = []
+
+    async def goal(trigger):
+        asked.append(trigger.agent_id)
+        return None if trigger.agent_id == "miner" else trigger.goal + " Also: 3 are due."
+    async with Session() as db:
+        db.add(_row("miner", "done", origin="agenda"))  # covered: goal() is never asked
+        await db.flush()
+        [scan] = await triggers.due(host, db, "org", now=MONDAY + timedelta(hours=1),
+                                    origin="agenda", goal=goal)
+        assert await triggers.due(host, db, "org", now=MONDAY + timedelta(hours=2),
+                                  origin="agenda", goal=goal) == []
+    assert (scan.origin, scan.goal, asked) == ("agenda", "Scan Also: 3 are due.", ["scout"])
+
+
+async def test_a_reworded_goal_does_not_run_a_second_time_that_day(Session):
+    async with Session() as db:
+        db.add(_row("scout", "done", goal="Scan the old way"))
+        await db.flush()
+        host = Host(triggers=(T("scout", when="schedule", goal="Scan"),))
+        assert await triggers.due(host, db, "org", now=MONDAY + timedelta(hours=1)) == []
+
+
+async def test_several_schedules_of_one_agent_are_told_apart_by_their_goal(Session):
+    host = Host(triggers=(T("scout", when="schedule", goal="Scan posts"),
+                          T("scout", when="schedule", goal="Read the news")))
+    async with Session() as db:
+        db.add(_row("scout", "done", goal="Scan posts. Also: more"))
+        await db.flush()
+        [news] = await triggers.due(host, db, "org", now=MONDAY + timedelta(hours=1))
+    assert news.goal == "Read the news"
+    with pytest.raises(ValueError, match="starts another"):
+        triggers.check([T("scout", when="schedule", goal="Scan"),
+                        T("scout", when="schedule", goal="Scan posts")], ["scout"])
+
+
+def test_schedules_alone_cost_a_finishing_task_nothing():
+    assert not triggers.used_by(Host(triggers=(T("scout", when="schedule", goal="Scan"),)))
+    assert triggers.used_by(Host(triggers=(T("miner", when="done", after="scout", goal="m"),)))

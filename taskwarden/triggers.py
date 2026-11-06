@@ -148,9 +148,14 @@ def check(triggers: Iterable[Trigger], agent_ids: Iterable[str]) -> None:
         for name in (t.agent_id, t.after):
             if name is not None and name not in known:
                 raise ValueError(f"trigger for {t.agent_id}: unknown agent {name!r}")
-    schedules = [(t.agent_id, t.goal) for t in triggers if t.when == SCHEDULE]
-    if len(schedules) != len(set(schedules)):
-        raise ValueError("two schedules of one agent share a goal: give each its own words")
+    # An agent's several schedules are told apart by how their goals start (`due`).
+    goals: dict[str, list[str]] = {}
+    for t in triggers:
+        if t.when == SCHEDULE:
+            goals.setdefault(t.agent_id, []).append(t.goal)
+    for agent, own in goals.items():
+        if any(i != j and b.startswith(a) for i, a in enumerate(own) for j, b in enumerate(own)):
+            raise ValueError(f"{agent}: one schedule's goal starts another's: give each its own words")
     follows: dict[str, set[str]] = {}
     for t in triggers:
         if t.when == DONE:
@@ -183,8 +188,10 @@ async def all_of(host, db, organization_id: str) -> list[Trigger]:
 
 
 def used_by(host) -> bool:
-    """The host declares triggers or reads routines; without either, nothing here runs."""
-    return bool(getattr(host, "triggers", ())) or getattr(host, "custom_triggers", None) is not None
+    """Something can follow a finished task: a `done` trigger, or routines the host reads back.
+    A host with schedules only (or nothing) pays nothing when a task finishes."""
+    return (any(t.when == DONE for t in getattr(host, "triggers", ()) or ())
+            or getattr(host, "custom_triggers", None) is not None)
 
 
 async def _awake(host, db, organization_id: str) -> tuple[Any, set[str]]:
@@ -209,9 +216,10 @@ async def _queue(host, db, organization_id: str, trigger: Trigger, goal: str, or
     mine = recent.where(Task.agent_id == trigger.agent_id)
     if once_a_day and await _count(db, mine.where(Task.goal == goal)):
         return None  # the same event twice: a retried webhook, a forwarded email
-    if await _count(db, mine.where(Task.origin.in_((SCHEDULED, TRIGGERED)))) >= trigger.max_per_day:
+    started = Task.origin.in_({SCHEDULED, TRIGGERED, origin})
+    if await _count(db, mine.where(started)) >= trigger.max_per_day:
         return None
-    if (await _count(db, recent.where(Task.origin.in_((SCHEDULED, TRIGGERED))))
+    if (await _count(db, recent.where(started))
             >= TRIGGERED_DAILY_CAP or await _count(db, recent) >= DAILY_TASK_CAP):
         return None
     task = Task(id=uuid.uuid4(), organization_id=organization_id, agent_id=trigger.agent_id,
@@ -283,11 +291,20 @@ def _is_due(trigger: Trigger, local: datetime) -> bool:
     return True
 
 
-async def due(host, db, organization_id: str, *, now: Optional[datetime] = None) -> list[Any]:
-    """Queue the schedules due now for one business: once per local day (one retry after a
-    failure), never while an earlier run of the same schedule is still open (most often parked
-    on an approval). Call it from the sweeper's `on_sweep`, which runs under its lock, once per
-    business. Returns the queued tasks, committed."""
+async def due(host, db, organization_id: str, *, now: Optional[datetime] = None,
+              origin: str = SCHEDULED,
+              goal: Optional[Callable[[Trigger], Awaitable[Optional[str]]]] = None) -> list[Any]:
+    """Queue the schedules due now for one business. A schedule runs once per local day (one
+    retry after a failure), never while an earlier run of it is still open (most often parked
+    on an approval), and never while its agent already has work in hand today (the owner's
+    request first; the next sweep tries again). Call it from the sweeper's `on_sweep`, which
+    runs under its lock, once per business. Returns the queued tasks, committed.
+
+    `origin`: what the tasks are marked, for a host that already names its scheduled work.
+    `goal(trigger)`: today's words for a schedule that is otherwise due -- its goal and
+    anything the day adds -- or None to skip it today (switched off, nothing to do). Called
+    last, so work it does (drafting what the goal points to) happens only for a run that starts.
+    """
     now = now or datetime.now(timezone.utc)
     schedules = [t for t in await all_of(host, db, organization_id) if t.when == SCHEDULE]
     if not schedules:
@@ -300,16 +317,26 @@ async def due(host, db, organization_id: str, *, now: Optional[datetime] = None)
     for t in schedules:
         if t.agent_id not in awake or not _is_due(t, local):
             continue
-        same = select(Task.status).where(
-            Task.organization_id == organization_id, Task.agent_id == t.agent_id,
-            Task.origin == SCHEDULED, Task.goal == t.goal)
-        if (await db.execute(same.where(Task.created_at < day_start,
+        agent = (Task.organization_id == organization_id, Task.agent_id == t.agent_id)
+        runs = select(Task.status).where(*agent, Task.origin == origin)
+        if sum(1 for s in schedules if s.agent_id == t.agent_id) > 1:
+            # Several schedules: a run is this one's when its goal starts with this goal (the
+            # day's words come after it). One schedule: every run of its origin is its own, so
+            # a goal reworded in a deploy can't start a second run the same day.
+            runs = runs.where(Task.goal.startswith(t.goal, autoescape=True))
+        if (await db.execute(runs.where(Task.created_at < day_start,
                                         Task.status.in_(_ACTIVE)).limit(1))).first():
             continue
-        today = (await db.execute(same.where(Task.created_at >= day_start))).scalars().all()
+        today = (await db.execute(runs.where(Task.created_at >= day_start))).scalars().all()
         if any(s != "failed" for s in today) or len(today) >= MAX_TRIES:
             continue
-        if task := await _queue(host, db, organization_id, t, t.goal, SCHEDULED, now,
+        if (await db.execute(select(Task.id).where(
+                *agent, Task.created_at >= day_start, Task.status.in_(_ACTIVE)).limit(1))).first():
+            continue  # already on something today
+        words = t.goal if goal is None else await goal(t)
+        if not words:
+            continue
+        if task := await _queue(host, db, organization_id, t, words, origin, now,
                                 once_a_day=False):
             out.append(task)
     if out:

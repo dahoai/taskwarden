@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 (2026-11-06)
+
+`triggers.due` carries a host's own scheduled work (Perbene's standing agenda runs on it).
+
+- `due(..., origin=)`: a host keeps its own name for scheduled tasks.
+- `due(..., goal=)`: an async callback gives the day's words for a schedule that is otherwise
+  due (its goal plus what the day adds), or None to skip it today. Called last, so work it
+  does happens only for a run that starts.
+- A schedule waits while its agent already has work in hand today (the owner's request first).
+- One schedule per agent: every run of its origin is its own, so a goal reworded in a deploy
+  can't start a second run that day. Several: told apart by how their goals start, and
+  `check` refuses one goal that starts another.
+- `used_by(host)` is true only with `done` triggers or routines: a host with schedules alone
+  pays nothing when a task finishes.
+
 ## 0.3.0 (2026-11-05)
 
 New and optional; a host without triggers behaves as in 0.2.1.

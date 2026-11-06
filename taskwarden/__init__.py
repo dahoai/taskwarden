@@ -7,4 +7,4 @@ teammate's finished work wakes an agent), folders (agents as AGENT.md + skills),
 columns), host (what the app supplies). See README.md.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
