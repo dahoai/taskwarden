@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1 (2026-11-09)
+
+- PyPI / package one-liner: approvals-and-audit pitch, SQLite to try — no longer ends on
+  "Postgres".
+
 ## 0.6.0 (2026-11-09)
 
 - A missing account no longer ends the task: a handler or `check` raises

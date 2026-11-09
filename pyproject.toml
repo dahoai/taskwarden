@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "taskwarden"
-version = "0.6.0"
-description = "A durable, owner-approved AI team for a business: agents as folders, tools by risk, owner approvals that survive restarts, on Postgres."
+version = "0.6.1"
+description = "Approvals and audit for AI agents that act: tools by risk, ask/allow/observe, owner parks that survive restarts. Try on SQLite."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

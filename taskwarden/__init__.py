@@ -1,4 +1,4 @@
-"""taskwarden: a durable, owner-approved AI team for a business.
+"""taskwarden: approvals and audit for AI agents that act.
 
 Modules: loop (one task's run), gate (who may run what), tools (Tool, risk tiers, running a
 call), decisions (the owner's approve / edit / decline), sweeper (background runs), replies
@@ -7,4 +7,4 @@ teammate's finished work wakes an agent), folders (agents as AGENT.md + skills),
 columns), host (what the app supplies). See README.md.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
