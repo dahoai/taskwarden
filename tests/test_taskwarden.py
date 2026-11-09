@@ -327,6 +327,74 @@ async def test_an_approval_for_an_agent_paused_while_it_waited_does_not_run():
     assert task.status == "queued"  # the agent reads why and reports
 
 
+# ── A tool whose account isn't connected asks the owner to connect it, then carries on ──
+
+def _mailbox_host(connected: list):
+    async def _inbox(ctx, **_):
+        if not connected:
+            raise tools.NeedsConnect("Gmail", url="https://shop.example/connect/gmail")
+        return "3 unread emails"
+    host = ShopHost()
+    host.tools["read_inbox"] = tools.Tool("read_inbox", tools.READ, tools.fn_schema("read_inbox", "Inbox"), _inbox)
+    host.agent = lambda agent_id: Agent(agent_id, agent_id.title(), tools=("read_inbox", "refund"))
+    return host
+
+
+async def test_a_missing_account_parks_on_a_connect_card_and_the_task_carries_on_once_connected():
+    connected: list = []
+    host, task, db = _mailbox_host(connected), _task(), _db()
+    llm = _llm(Msg(calls=[("read_inbox", {})]))
+    assert await loop.run_task(host, db, task, llm=(llm, "m")) == "waiting"
+    assert task.pending["kind"] == "connect" and task.pending["account"] == "Gmail"
+    assert task.pending["url"] == "https://shop.example/connect/gmail"
+    assert host.told == ["connect"] and host.posted[-1]["body"] == "Connect Gmail so I can carry on."
+
+    db.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: task))
+    assert await decisions.claim(host, db, "shop1", task.id, "connected") is task
+    connected.append("Gmail")
+    await decisions.apply(host, db, "shop1", task, "connected")
+    assert {"role": "tool", "tool_call_id": "c0",
+            "content": "The owner connected Gmail. Call read_inbox again to carry on."} in task.state
+    assert host.posted[-1]["body"] == "Connected Gmail."
+
+    llm = _llm(Msg(calls=[("read_inbox", {})]), Msg("You have 3 unread emails."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert host.posted[-1] == {"body": "You have 3 unread emails."}
+
+
+async def test_a_missing_account_found_by_the_check_parks_before_any_approval_card():
+    from taskwarden.host import BaseHost
+
+    async def _no_stripe(ctx, **_):
+        raise tools.NeedsConnect("Stripe")
+    host, task = ShopHost(), _task()
+    host.tools["refund"] = replace(host.tools["refund"], check=_no_stripe)
+    host.precheck = lambda tool, ctx, args: BaseHost.precheck(host, tool, ctx, args)
+    llm = _llm(Msg(calls=[("refund", {"order_id": "A7"})]))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "waiting"
+    assert task.pending["kind"] == "connect" and task.pending["tool"] == "refund"
+    assert host.told == ["connect"]
+
+
+async def test_a_task_that_cant_wait_is_told_the_account_is_missing_instead_of_parking():
+    host, task = _mailbox_host([]), _task()
+    host.never_waits = lambda task: True
+    llm = _llm(Msg(calls=[("read_inbox", {})]), Msg("Gmail isn't connected."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert {"role": "tool", "tool_call_id": "c0",
+            "content": loop.NOT_CONNECTED.format(account="Gmail")} in task.state
+
+
+async def test_an_approved_call_whose_account_dropped_while_it_waited_is_not_counted_as_sent():
+    host = ShopHost()
+    task, db = await _park_refund(host)
+    host.execute = AsyncMock(side_effect=tools.NeedsConnect("Stripe"))
+    await decisions.apply(host, db, "shop1", task, "approve")
+    assert {"role": "tool", "tool_call_id": "c0",
+            "content": decisions.DISCONNECTED.format(account="Stripe")} in task.state
+    assert host.audit.call_args.kwargs["decision"] == "error"
+
+
 # ── A long run sheds its old tool results before it is made to wrap up ──
 
 def test_old_results_are_cut_to_their_opening_and_the_latest_stay_whole():

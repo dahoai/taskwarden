@@ -14,4 +14,3 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
       - run: python examples/shop.py
-      - run: python examples/launch_team.py

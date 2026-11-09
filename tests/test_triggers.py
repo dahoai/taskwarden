@@ -1,6 +1,5 @@
 """Triggers: what wakes an agent besides the owner, on a real (SQLite) database."""
 import pathlib
-import runpy
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -211,14 +210,6 @@ async def test_a_routine_always_asks_and_is_refused_when_it_would_loop_or_never_
     for t in (saved[0], T("scout", when="schedule", cadence="weekly", weekday=4, goal="w"),
               T("inbox", when="event", event="e", goal="i"), T("miner", when="done", after="scout", goal="m")):
         assert triggers.parse(t.agent_id, triggers.as_dict(t)) == t  # what is stored reads back
-
-
-def test_the_launch_team_example_runs(capsys):
-    runpy.run_path(str(ROOT / "examples" / "launch_team.py"), run_name="__main__")
-    out = capsys.readouterr().out
-    assert "09:01 due: ['scout']" in out and "email:bugs woke: ['inbox'] then []" in out
-    assert "inbox      trigger  waiting waits on send_email" in out
-    assert "judge      trigger  done" in out and "routines: ['every Friday at 16:00']" in out
 
 
 # ── The guards that hold when what woke the agent is a stranger's words ──

@@ -80,8 +80,9 @@ class Host(Protocol):
     def decide(self, agent: Any, tool: Optional[Tool], state: AgentState, *,
                self_started: bool) -> Decision: ...
     async def precheck(self, tool: Tool, ctx: Any, args: dict) -> Optional[str]:
-        """The tool's own check before the owner is asked. Must not raise: a check that fails
-        to run returns None, and the owner is asked as before."""
+        """The tool's own check before the owner is asked. Must not raise, except
+        tools.NeedsConnect: a check that fails to run returns None, and the owner is asked as
+        before."""
     def clean_args(self, args: dict) -> dict:
         """The arguments a parked call keeps: without the ones the server owns."""
     def use_skill(self, agent: Any, args: dict, loaded: set[str]) -> tuple[str, tuple[str, ...]]:
@@ -228,6 +229,8 @@ class BaseHost:
             return None
         try:
             return await _tools.check(tool, ctx, args)
+        except _tools.NeedsConnect:
+            raise
         except Exception:  # a check that can't run asks the owner as before
             logger.exception("taskwarden_precheck_failed tool=%s", tool.name)
             return None

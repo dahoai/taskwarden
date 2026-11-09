@@ -1,5 +1,6 @@
 """The owner's decision on a parked task: approve, decline, revise (they wrote a change instead
-of approving), or answer (a question). Claimed first, then carried out.
+of approving), answer (a question), or connected (they connected the account a tool needed).
+Claimed first, then carried out.
 
 `claim` is quick and committed, so an app can answer the owner at once and `apply` in the
 background (approved actions, texts, emails, campaigns, can take a minute).
@@ -13,6 +14,7 @@ from sqlalchemy import select, update
 
 from . import gate
 from .loop import MAYBE_SENT, pending_calls, tool_msg
+from .tools import NeedsConnect
 
 # What a parked call reads when the owner wrote in the chat instead of approving it.
 REVISE_RESULT = ("Not done yet: the owner replied instead of approving: \"{change}\". If it "
@@ -26,6 +28,11 @@ NOT_ALLOWED = "Not run: the owner approved it, but you may no longer do this. Sa
 # what really went out.
 EDITED = "The owner changed {fields} before approving, and it ran as changed. "
 APPROVAL_DECISIONS = ("approve", "decline", "revise")
+# What a call parked on a missing account reads once the owner connected it.
+CONNECTED = "The owner connected {account}. Call {tool} again to carry on."
+# An approved call whose account was disconnected while it waited.
+DISCONNECTED = ("Not run: {account} isn't connected any more. Call it again and the owner "
+                "will be asked to connect it.")
 
 
 def edited(args: dict, edits: Optional[dict]) -> tuple[dict, list[str]]:
@@ -129,7 +136,10 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
             if host.decide(agent, tool, state, self_started=False).outcome == gate.DENY:
                 refusal, rule = NOT_ALLOWED, "no_longer_allowed"
             elif tool.check is not None:
-                refusal, rule = await host.precheck(tool, ctx, call.get("args") or {}), "precheck"
+                try:
+                    refusal, rule = await host.precheck(tool, ctx, call.get("args") or {}), "precheck"
+                except NeedsConnect as e:
+                    refusal, rule = DISCONNECTED.format(account=e.account), "needs_connect"
             if refusal:
                 host.audit(db, organization_id=organization_id, agent_id=task.agent_id,
                            tool=call["tool"], risk=tool.risk, decision="deny", rule=rule,
@@ -143,7 +153,10 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
                 task.state = answered(task.state or [], [tool_msg(call.get("tool_call_id", ""), MAYBE_SENT)])
                 task.contacted = sorted(sent | {key})
                 await db.commit()
-            out, ok, _ = await host.execute(tool, ctx, call.get("args") or {})
+            try:
+                out, ok, _ = await host.execute(tool, ctx, call.get("args") or {})
+            except NeedsConnect as e:  # nothing ran: not sent
+                out, ok = DISCONNECTED.format(account=e.account), False
             host.audit(db, organization_id=organization_id, agent_id=task.agent_id,
                        tool=call["tool"], risk=tool.risk,
                        decision="approved" if ok else "error",
@@ -165,12 +178,15 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
         results.append({"role": "tool", "tool_call_id": call.get("tool_call_id", ""), "content": out})
     if any(runs):
         task.contacted = sorted(sent)
+    connected = pending.get("kind") == "connect" and decision == "connected"
     if not is_approval:
         results = [{"role": "tool", "tool_call_id": pending.get("tool_call_id", ""),
-                    "content": f"Owner answered: {answer or note or ''}"}]
+                    "content": CONNECTED.format(account=pending.get("account"), tool=pending.get("tool"))
+                    if connected else f"Owner answered: {answer or note or ''}"}]
     # `shown`: how the chat shows the owner's answer when it differs from what the agent
     # reads (a file's name, not the whole file).
-    echo, kind = shown or answer or note or "", "text"
+    echo, kind = shown or answer or note or (f"Connected {pending.get('account')}."
+                                             if connected else ""), "text"
     if is_approval and decision != "revise":
         # What was decided, as data: the app words it for the owner, and the team's history
         # reads it back as one line.

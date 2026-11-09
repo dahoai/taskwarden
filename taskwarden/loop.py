@@ -24,7 +24,7 @@ from sqlalchemy import func, select
 
 from . import gate, triggers
 from .folders import USE_SKILL
-from .tools import READ, ROUTINE, capture_looks
+from .tools import READ, ROUTINE, NeedsConnect, capture_looks
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,11 @@ PRACTICE = ("Practice mode: not done, nothing was sent or changed.\n{call}\nCarr
             "request, and list in your report each action you would have taken.")
 MAX_DELEGATIONS_PER_TASK = 5  # across every run of the task, approval resumes and retries included
 DAILY_TASK_CAP = 200  # ponytail: flat per-business cap over a rolling 24h; plan-based when outgrown
+# A tool whose account isn't connected (tools.NeedsConnect): the owner is asked to connect it
+# and the task carries on, instead of the agent saying it can't. A task that can't wait says so.
+CONNECT_ASK = "Connect {account} so I can carry on."
+NOT_CONNECTED = ("Not done: {account} isn't connected, and this task can't wait for the owner "
+                 "to connect it. Put it in your report.")
 DONE, WAITING, STOPPED = "done", "waiting", "stopped"
 STOPPED_BEFORE = "Not run: the owner stopped the task first."
 # A message the owner sent while the task was running (host.take_messages).
@@ -440,6 +445,9 @@ async def park(host, db, task: Any, history: list, pending: dict, name: str, act
     if pending["kind"] == "approval":
         body, summary = describe_pending(pending), \
             f"{name} wants to run {pending_tool(pending)['tool']}."
+    elif pending["kind"] == "connect":
+        body = CONNECT_ASK.format(account=pending["account"])
+        summary = f"{name} needs {pending['account']} connected."
     elif internal:
         asked = host.agent(pending["agent"]).name
         body, summary = f"Asked {asked}: {pending['question']}", f"{name} is waiting on {asked}."
@@ -660,6 +668,16 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     # rest to teammates: no question and no consult; what needs the owner goes in its report.
     never_waits = host.never_waits(task)
 
+    def connect(tc_id: str, tool_name: str, e: NeedsConnect) -> tuple[Optional[dict], Optional[str]]:
+        """(what the task parks on, or the tool message when this task can't wait)."""
+        host.audit(db, organization_id=org, agent_id=agent.id, tool=tool_name,
+                   risk=host.tools[tool_name].risk, decision="deny", rule="needs_connect",
+                   task_id=task.id, actor=actor)
+        if never_waits or watching:
+            return None, NOT_CONNECTED.format(account=e.account)
+        return {"kind": "connect", "tool_call_id": tc_id, "tool": tool_name,
+                "account": e.account, "url": e.url}, None
+
     def offers(n: str) -> bool:  # a watch task is offered its reads, and only those
         return not watching or host.tools[n].risk == READ
     tools = [host.tools[n].schema for n in allowed if n in offered and offers(n)]
@@ -879,7 +897,13 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                 continue
             if (decision.outcome in (gate.ASK, gate.ALLOW) and tool is not None
                     and tool.check is not None):
-                refusal = await host.precheck(tool, ctx, args)
+                try:
+                    refusal = await host.precheck(tool, ctx, args)
+                except NeedsConnect as e:
+                    parked, out = connect(tc.id, tool_name, e)
+                    if out is not None:
+                        history.append(tool_msg(tc.id, out))
+                    continue
                 if refusal:
                     # Can't work as it stands: say why now, instead of an approval card the
                     # owner would approve only to see it fail, or a send that should not go.
@@ -915,8 +939,14 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                     task.state = [*history, tool_msg(tc.id, MAYBE_SENT)]
                     task.contacted = sorted(sent_task | {sent})
                     await db.commit()
-                with capture_looks() as looked:
-                    out, ok, raw = await host.execute(tool, ctx, args)
+                try:
+                    with capture_looks() as looked:
+                        out, ok, raw = await host.execute(tool, ctx, args)
+                except NeedsConnect as e:  # nothing ran, so nothing counts as sent
+                    parked, out = connect(tc.id, tool_name, e)
+                    if out is not None:
+                        history.append(tool_msg(tc.id, out))
+                    continue
                 pictures += looked
                 if tool.risk == READ:
                     if ok and raw is not None:

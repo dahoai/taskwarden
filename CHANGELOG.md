@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- A missing account no longer ends the task: a handler or `check` raises
+  `tools.NeedsConnect(account, url=None)`, the task parks on a `connect` card
+  (`pending.kind == "connect"`), and the owner's `"connected"` decision resumes it so the agent
+  calls the tool again. A task that can't wait is told instead; an approved call whose account
+  dropped while it waited doesn't run.
+- `examples/launch_team.py` removed; `examples/shop.py` is the example.
+- README leads with what the harness guarantees, and says SQLite is enough to try it.
+
 ## 0.5.0 (2026-11-06)
 
 - Outside words are fenced: what `fire` and `follow` put under a goal is marked line by line

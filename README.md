@@ -1,24 +1,27 @@
 # Taskwarden
 
-**A durable, owner-approved AI team for a business.**
+**Your agent can't send, pay or delete without a human click, and it survives restarts.**
 
-Taskwarden is a Python harness for running a small team of AI agents that do real work for a
-business (texting customers, booking, refunding, posting) on a server, safely. The owner
-decides what each agent may do alone and what must ask first. Anything that asks waits on a
-queue in your database until the owner approves, edits or declines it, then carries on where
-it stopped, even after a restart.
+Taskwarden is a Python harness for agents that act on real accounts, unattended. Every tool has
+a risk level, and per agent you choose `allow`, `ask` or `observe`. A call that asks parks the
+task in your database until a person approves, edits or declines it, then the task resumes
+where it stopped, in any process, even days later. A send can't go out twice after a crash,
+and every call is audited with the rule that decided it.
 
 It runs the AI team of [Perbene](https://perbene.ai) in production, for many businesses at once.
 
 ```bash
-pip install taskwarden
+pip install "taskwarden[dev]"   # SQLite and the test tools: enough to run the example
+python examples/shop.py          # an agent that reads orders alone and refunds only with a click
 ```
 
-## Why another agent framework
+No Postgres or Redis needed to try it. Add Postgres for production and Redis for the
+background sweeper when you run many tasks at once.
 
-Most frameworks are built for one person at a keyboard, or for a demo. A business's team runs
-unattended, for many businesses at once, and its mistakes reach customers. Taskwarden is built
-around the questions that come up then:
+## What it handles that agent frameworks don't
+
+Most frameworks are built for one person at a keyboard, or for a demo. An agent that runs
+unattended, on real accounts, for many businesses at once, hits these:
 
 | What goes wrong | What Taskwarden does |
 | --- | --- |
@@ -26,6 +29,7 @@ around the questions that come up then:
 | The owner approves a message with one wrong word | The owner can **edit** the words before approving; the agent is told what changed. |
 | The server restarts mid-send, and the retry sends it twice | A send is saved as "may have gone out" **before** it runs, and the same message never goes to the same person twice in a task (once your host says what counts as a send: `sent_key`). |
 | An approval waits three days | Parked tasks live in **your database**, not in memory: approve from any process, any time. |
+| The agent needs an account nobody connected yet | A tool raises `NeedsConnect("Gmail", url)`: the task parks on a **connect card**, and once the owner connects it the agent retries and carries on, instead of saying it can't. |
 | A tool hangs | Each tool has a **timeout**; a send stopped by it counts as sent. |
 | A long task overflows the model's context | Old tool results are **compacted** before the run is made to wrap up. |
 | The model repeats the same call | It is **reminded once**, then stopped. |
@@ -171,9 +175,17 @@ Agents can set up their own routines: give one `triggers.routine_tool(host, save
 `custom_triggers(db, org)` to read back what `save` stored. Adding a routine is a `profile`
 call, so it always waits for the owner's click.
 
-[`examples/launch_team.py`](examples/launch_team.py) runs a five-agent launch team offline:
-Scout on Mondays, Pain Miner and Judge on each other's reports, Inbox on email, and a routine
-Chief sets up once the owner approves.
+## Missing accounts
+
+A tool that works through an account (a mailbox, a calendar, a payment provider) raises
+`tools.NeedsConnect(account, url=None)` from its handler or its `check` when that account
+isn't connected. Keep offering the tool either way: the model calls it, the task parks with
+`pending = {"kind": "connect", "account", "url", "tool"}` and `notify_parked` shows the owner
+a Connect button (`url` is your sign-in link). When they finish, your app calls
+`decisions.claim(..., "connected")` and `decisions.apply(..., "connected")`, and the resumed
+task calls the tool again. A task that can't wait is told the account is missing and puts it
+in its report. An approved call whose account was disconnected while it waited doesn't run,
+and the agent is told to call it again.
 
 ## Spend
 
@@ -197,8 +209,8 @@ is yours as the host.
 
 ## Requirements
 
-Python 3.11+, SQLAlchemy 2 (async), PyYAML. Postgres in production (SQLite works for trying
-it out), Redis for the sweeper's lock. Any OpenAI-compatible chat model with tool calls.
+Python 3.11+, SQLAlchemy 2 (async), PyYAML. SQLite to try it, Postgres in production, Redis
+only for the sweeper's lock. Any OpenAI-compatible chat model with tool calls.
 
 ## Tests
 

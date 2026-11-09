@@ -50,6 +50,17 @@ SLOW_MAYBE_DONE = ("Unknown: it took too long and was stopped, so it may have go
                    "Check before doing it again.")
 
 
+class NeedsConnect(Exception):
+    """Raised by a handler or a check when the account it works through (a mailbox, a
+    calendar) is not connected. The task parks on a "connect" card for the owner, with `url`
+    when the app has a sign-in link, and carries on once they connect it, instead of the
+    agent saying it can't."""
+
+    def __init__(self, account: str, url: Optional[str] = None) -> None:
+        super().__init__(account)
+        self.account, self.url = account, url
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -144,6 +155,9 @@ async def execute(tool: Tool, ctx: Any, args: dict[str, Any], *,
             if tool.risk != READ:
                 await _commit(ctx)
             return out, True
+        except NeedsConnect:  # nothing ran: the caller parks the task for the owner
+            await _rollback(ctx)
+            raise
         except asyncio.TimeoutError:
             logger.warning("team_tool_timeout tool=%s organization_id=%s seconds=%s",
                            tool.name, _org(ctx), limit)
