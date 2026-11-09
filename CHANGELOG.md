@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-11-09)
 
 - A missing account no longer ends the task: a handler or `check` raises
   `tools.NeedsConnect(account, url=None)`, the task parks on a `connect` card
