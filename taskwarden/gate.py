@@ -1,10 +1,10 @@
 """The action boundary: every tool call is decided before it runs.
 
-Order, first match wins: tool not granted -> deny; agent paused -> deny; an agent in practice
-("observe") -> reads run, everything else is only recorded; a self-started task
-reaching a customer or the money -> ask; remove/profile -> always ask; read/draft/routine ->
-allow; contact/spend/change -> the agent's setting ("ask" | "allow"); anything else -> deny
-(fail closed).
+Order, first match wins: tool not granted -> deny; agent paused -> deny; a setting that isn't
+`allow`/`ask`/`observe` -> deny; an agent in practice ("observe") -> reads run, everything else
+is only recorded; a self-started task reaching a customer or the money -> ask; remove/profile ->
+always ask; read/draft/routine -> allow; contact/spend/change -> the agent's setting ("ask" |
+"allow"); anything else -> deny (fail closed).
 
 A self-started task (one the app's own schedule began, not the owner) never sends, spends or
 commits the business without a click, however loose the agent's setting is: it reads and
@@ -46,9 +46,12 @@ def decide(agent: Any, tool: Optional[Tool], state: AgentState, *,
         return Decision(DENY, "tool_not_granted")
     if state.paused:
         return Decision(DENY, "agent_paused")
+    if state.setting not in (ALLOW, ASK, OBSERVE):
+        return Decision(DENY, "unknown_setting")  # a corrupted setting never loosens the gate
     if state.setting == OBSERVE:
         return Decision(ALLOW, "safe_action") if tool.risk == READ else Decision(OBSERVE, "practice")
-    if self_started and (tool.risk in (CONTACT, SPEND, CHANGE) or tool.name in outward):
+    if self_started and (tool.risk in (CONTACT, SPEND, CHANGE)
+                         or (tool.risk == ROUTINE and tool.name in outward)):
         return Decision(ASK, SELF_STARTED_NEEDS_OWNER)
     if tool.risk == REMOVE:  # deletes can't be undone: always the owner's click
         return Decision(ASK, "always_ask_remove")

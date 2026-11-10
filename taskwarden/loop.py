@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
-from . import gate, triggers
+from . import gate, replies, triggers
 from .folders import USE_SKILL
 from .tools import READ, ROUTINE, NeedsConnect, capture_looks
 
@@ -646,7 +646,10 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
         return task.status
     # A trigger's task is never the owner's, whatever the host counts as self-started.
     triggered = task.origin in (triggers.SCHEDULED, triggers.TRIGGERED, triggers.WATCHED)
-    self_started = host.self_started(task) or triggered
+    # A task that has read a customer's reply carries outside words too: its later runs are
+    # self-started, so a reply cannot steer the task into sending or spending on its own.
+    replied = replies.woken(task)
+    self_started = host.self_started(task) or triggered or replied
     watching = task.origin == triggers.WATCHED  # reads only: enforced here, not in the words
     ctx, company = await host.context(db, org)
     ctx.self_started = self_started
@@ -683,8 +686,8 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     tools = [host.tools[n].schema for n in allowed if n in offered and offers(n)]
     if not never_waits and not watching:
         tools.append(ASK_PERSON_SCHEMA)
-    if agent.folder and (skill_schema := agent.folder.use_skill_schema(loaded)):
-        tools.append(skill_schema)
+    if not watching and agent.folder and (skill_schema := agent.folder.use_skill_schema(loaded)):
+        tools.append(skill_schema)  # a watch task reads, loads nothing, and asks no one
     if not watching:
         tools += host.local_schemas(channel, task)
     chain = await _ancestors(host, db, task)

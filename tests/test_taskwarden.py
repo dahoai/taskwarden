@@ -595,3 +595,61 @@ async def test_a_model_that_cant_see_is_never_sent_a_picture():
     llm, sent = _recording(Msg("A receipt."))
     assert await loop.run_task(host, _db(), task, llm=(llm, "llama-3")) == "done"
     assert "image_url" not in json.dumps(sent[0])
+
+
+# ── The demo ships with the package, so a plain install can run it ──
+
+async def test_the_offline_demo_runs_from_the_package(capsys):
+    from taskwarden import demo
+
+    await demo.main()  # what the `taskwarden-demo` console script runs
+    out = capsys.readouterr().out
+    assert "run:   waiting" in out
+    assert "waits: refund {'order_id': 'A7'}" in out
+    assert "Done: I refunded order A8, $19.50." in out
+
+
+# ── The small print the gate and the owner's decisions must not let through ──
+
+def test_a_tool_with_a_mistyped_risk_is_refused_when_it_is_declared():
+    with pytest.raises(ValueError, match="risk is one of"):
+        tools.Tool("send", "roudine", {}, _text)
+    with pytest.raises(ValueError, match="timeout"):
+        tools.Tool("send", tools.READ, {}, _text, timeout=0)
+
+
+def test_an_agent_setting_the_gate_does_not_know_fails_closed():
+    host = ShopHost()
+    decision = gate.decide(Agent("lead", "Lead"), host.tools["read_orders"],
+                           gate.AgentState(setting="allow-ish"))
+    assert decision == gate.Decision(gate.DENY, "unknown_setting")
+
+
+async def test_an_approval_for_an_agent_switched_to_practice_while_it_waited_does_not_run():
+    host = ShopHost()
+    task, db = await _park_refund(host)
+    host.agent_states = AsyncMock(return_value={"lead": gate.AgentState(setting=gate.OBSERVE)})
+    await decisions.apply(host, db, "shop1", task, "approve")
+    assert {"role": "tool", "tool_call_id": "c0", "content": decisions.IN_PRACTICE} in task.state
+    assert host.audit.call_args.kwargs["decision"] == "observe"
+    assert host.audit.call_args.kwargs["rule"] == "practice"
+
+
+async def test_an_approved_message_already_in_contacted_is_not_sent_again():
+    host = ShopHost()
+    host.sent_key = lambda name, args, region: (
+        f"{name}|{args.get('order_id')}" if name == "refund" else None)
+    task, db = await _park_refund(host)
+    task.contacted = ["refund|A7"]
+    await decisions.apply(host, db, "shop1", task, "approve")
+    assert {"role": "tool", "tool_call_id": "c0", "content": decisions.ALREADY_SENT} in task.state
+    assert host.audit.call_args.kwargs["decision"] == "deny"
+    assert host.audit.call_args.kwargs["rule"] == "duplicate_send"
+
+
+async def test_an_approval_with_no_call_behind_it_fails_instead_of_queuing_a_phantom():
+    host, task, db = ShopHost(), _task(), _db()
+    task.pending = {"kind": "approval"}
+    await decisions.apply(host, db, "shop1", task, "approve")
+    assert (task.status, task.pending) == ("failed", None)
+    assert host.posted[-1]["body"] == decisions.EMPTY_APPROVAL

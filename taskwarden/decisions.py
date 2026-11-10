@@ -24,6 +24,12 @@ REVISE_RESULT = ("Not done yet: the owner replied instead of approving: \"{chang
 GONE = "Not run: this action no longer exists. Say what you meant to do another way."
 # A parked call the agent may no longer make (paused, or the tool taken away while it waited).
 NOT_ALLOWED = "Not run: the owner approved it, but you may no longer do this. Say so in your report."
+# The agent was switched to practice while the call waited: nothing may run now.
+IN_PRACTICE = "Not run: the agent is in practice now, so nothing was sent or changed."
+# A call whose exact message is already in the task's `contacted`: never a second send.
+ALREADY_SENT = "Refused: this was already sent earlier, so it was not sent again."
+# A corrupt approval with no call behind it: fail it instead of posting a phantom answer.
+EMPTY_APPROVAL = "I couldn't finish: the approval had nothing to run."
 # What the model reads before the result of a call the owner edited, so its report names
 # what really went out.
 EDITED = "The owner changed {fields} before approving, and it ran as changed. "
@@ -98,7 +104,9 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
     thread. `task` is the claimed task, or its id from another session. `declined_calls`: on an
     approve, the batch's calls (by tool_call_id) the owner left out; `edited_args`, the text the
     owner rewrote before approving, by tool_call_id then argument (see `edited`). `resume`: the caller runs
-    the task now, so it stays "running" instead of going back to the queue."""
+    the task now, so it stays "running" instead of going back to the queue. Each call is decided
+    again first: a paused or practice-mode agent, a removed tool, a failed check, or a message
+    already in `contacted` never runs."""
     Task = host.Task
     if not isinstance(task, Task):
         task = (await db.execute(select(Task).where(
@@ -108,6 +116,14 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
             return
     pending = task.pending or {}
     is_approval = pending.get("kind") == "approval"
+    if is_approval and not (pending.get("batch") or pending.get("tool")):
+        # No call to run: fail the task rather than answer a phantom call id and queue it to
+        # loop forever on a decision that never existed.
+        task.pending, task.status, task.attempts = None, "failed", 0
+        host.post_message(db, organization_id=organization_id, thread=task.thread,
+                          sender=task.agent_id, body=EMPTY_APPROVAL, task_id=task.id)
+        await db.commit()
+        return
     calls = pending_calls(pending) if is_approval else []
     skip = set(declined_calls or ())
     runs = [decision == "approve" and c.get("tool_call_id", "") not in skip for c in calls]
@@ -132,21 +148,30 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
             results.append(tool_msg(call.get("tool_call_id", ""), GONE))
             continue
         if run:
-            refusal, rule = None, None
-            if host.decide(agent, tool, state, self_started=False).outcome == gate.DENY:
+            refusal, rule, refused_as = None, None, "deny"
+            outcome = host.decide(agent, tool, state, self_started=False).outcome
+            if outcome == gate.DENY:
                 refusal, rule = NOT_ALLOWED, "no_longer_allowed"
-            elif tool.check is not None:
+            elif outcome == gate.OBSERVE:
+                # The agent was switched to practice while the owner was deciding: the click
+                # approves the action, not a way around practice mode.
+                refusal, rule, refused_as = IN_PRACTICE, "practice", "observe"
+            key = host.sent_key(call["tool"], call.get("args") or {}, region)
+            if refusal is None and key is not None and key in sent:
+                # The resumed run must never send what an earlier run (or an earlier call in
+                # this batch) already recorded as sent.
+                refusal, rule = ALREADY_SENT, "duplicate_send"
+            if refusal is None and tool.check is not None:
                 try:
                     refusal, rule = await host.precheck(tool, ctx, call.get("args") or {}), "precheck"
                 except NeedsConnect as e:
                     refusal, rule = DISCONNECTED.format(account=e.account), "needs_connect"
             if refusal:
                 host.audit(db, organization_id=organization_id, agent_id=task.agent_id,
-                           tool=call["tool"], risk=tool.risk, decision="deny", rule=rule,
+                           tool=call["tool"], risk=tool.risk, decision=refused_as, rule=rule,
                            task_id=task.id, actor="owner")
                 results.append(tool_msg(call.get("tool_call_id", ""), refusal))
                 continue
-            key = host.sent_key(call["tool"], call.get("args") or {}, region)
             if key is not None:
                 # Saved before it runs, as in the loop: a crash mid-send must not lead to a
                 # second send when the task is retried.

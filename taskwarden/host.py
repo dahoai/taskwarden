@@ -8,7 +8,7 @@ unless it has a default in `BaseHost`: subclass it and write only what your app 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional, Protocol
 
@@ -146,6 +146,14 @@ class BaseHost:
                                "them. Put it in your report.")
     OUT_OF_STEPS = "I ran out of steps before finishing. Ask me to carry on."
     DAILY_TOKENS: Optional[int] = None  # each agent's daily token budget; None = no cap
+    # The ROUTINE tools that reach a customer (a text back, a booking): a task the app's
+    # schedule started parks them for the owner's click, like contact/spend/change. None = the
+    # host hasn't said, so every ROUTINE call is treated as reaching someone (safe by default);
+    # set it to the tools that do, and routine work that stays inside the business runs alone.
+    OUTWARD: Optional[frozenset[str]] = None
+    # How long a task may wait on a person (the owner's approval or answer, a teammate's
+    # answer) before the sweeper expires it. None = the sweeper's EXPIRE_AFTER (7 days).
+    APPROVAL_TTL: Optional[timedelta] = None
     STOPPED_REPLY = "Stopped."
     STOPPED_DID = "Done before that: {did}."
 
@@ -222,7 +230,11 @@ class BaseHost:
 
     # ── Each call ──
     def decide(self, agent, tool, state, *, self_started) -> Decision:
-        return gate.decide(agent, tool, state, self_started=self_started)
+        outward = self.OUTWARD
+        if outward is None:  # not said: a routine call at hand is assumed to reach someone
+            outward = (frozenset({tool.name})
+                       if tool is not None and tool.risk == _tools.ROUTINE else frozenset())
+        return gate.decide(agent, tool, state, self_started=self_started, outward=outward)
 
     async def precheck(self, tool, ctx, args) -> Optional[str]:
         if tool.check is None:

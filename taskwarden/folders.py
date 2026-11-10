@@ -106,6 +106,8 @@ def _read(path: Path, keys: set[str]) -> tuple[dict, str]:
         raise ValueError(f"{path}: starts with a --- frontmatter block")
     head, _, body = raw[4:].partition("\n---\n")
     meta = yaml.safe_load(head) or {}
+    if not isinstance(meta, dict):
+        raise ValueError(f"{path}: frontmatter is a mapping")
     if unknown := set(meta) - keys:
         raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
     text = " ".join(body.split())
@@ -142,11 +144,23 @@ def load_agent(folder: Path, groups: tuple[str, ...] = ()) -> AgentFolder:
     skills = tuple(load_skill(folder / "skills" / name / "SKILL.md")
                    for name in _names(path, meta, "skills"))
     agenda = meta.get("agenda")
-    if agenda is not None and (not isinstance(agenda, dict) or set(agenda) - _AGENDA_KEYS
-                               or not agenda.get("goal") or not agenda.get("cadence")):
-        raise ValueError(f"{path}: agenda has cadence, goal and optionally weekday and skills")
-    if unknown := set((agenda or {}).get("skills") or []) - {s.name for s in skills}:
-        raise ValueError(f"{path}: agenda preloads unknown skills {sorted(unknown)}")
+    if agenda is not None:
+        if not isinstance(agenda, dict) or set(agenda) - _AGENDA_KEYS:
+            raise ValueError(f"{path}: agenda has cadence, goal and optionally weekday and skills")
+        cadence, weekday = agenda.get("cadence"), agenda.get("weekday", 0)
+        if cadence not in ("daily", "weekly"):
+            raise ValueError(f"{path}: agenda cadence is daily or weekly")
+        if "weekday" in agenda and cadence != "weekly":
+            raise ValueError(f"{path}: agenda weekday is for weekly schedules")
+        if not isinstance(weekday, int) or isinstance(weekday, bool) or not 0 <= weekday <= 6:
+            raise ValueError(f"{path}: agenda weekday is 0 (Monday) to 6")
+        if not isinstance(agenda.get("goal"), str) or not agenda["goal"].strip():
+            raise ValueError(f"{path}: agenda needs a goal")
+        skills_list = agenda.get("skills") or []
+        if not isinstance(skills_list, list) or not all(isinstance(s, str) for s in skills_list):
+            raise ValueError(f"{path}: agenda skills is a list of names")
+        if unknown := set(skills_list) - {s.name for s in skills}:
+            raise ValueError(f"{path}: agenda preloads unknown skills {sorted(unknown)}")
     raw_triggers = meta.get("triggers") or []
     if not isinstance(raw_triggers, list):
         raise ValueError(f"{path}: triggers is a list")
@@ -155,12 +169,21 @@ def load_agent(folder: Path, groups: tuple[str, ...] = ()) -> AgentFolder:
     except ValueError as e:
         raise ValueError(f"{path}: {e}") from None
     types = meta.get("business_types")
-    if isinstance(types, str) and types not in groups:
+    if isinstance(types, str):
+        if types not in groups:
+            raise ValueError(f"{path}: business_types is a list, null or one of {groups}")
+    elif isinstance(types, list):
+        if not all(isinstance(t, str) and t for t in types):
+            raise ValueError(f"{path}: business_types is a list of names")
+    elif types is not None:
         raise ValueError(f"{path}: business_types is a list, null or one of {groups}")
+    on_demand = meta.get("skills_on_demand", False)
+    if not isinstance(on_demand, bool):
+        raise ValueError(f"{path}: skills_on_demand is true or false")
     return AgentFolder(
         id=meta["id"], name=meta["name"], title=meta["title"], core=core,
         tools=_names(path, meta, "tools"), skills=skills,
         aliases=_names(path, meta, "aliases"),
         business_types=tuple(types) if isinstance(types, list) else types,
         agenda={**agenda, "goal": " ".join(agenda["goal"].split())} if agenda else None,
-        on_demand=bool(meta.get("skills_on_demand")), triggers=triggers)
+        on_demand=on_demand, triggers=triggers)

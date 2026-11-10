@@ -11,8 +11,8 @@ and every call is audited with the rule that decided it.
 It runs the AI team of [Perbene](https://perbene.ai) in production, for many businesses at once.
 
 ```bash
-pip install "taskwarden[dev]"   # SQLite and the test tools: enough to run the example
-python examples/shop.py          # an agent that reads orders alone and refunds only with a click
+pip install "taskwarden[dev]"   # SQLite and the test tools: enough to run the demo
+taskwarden-demo                  # an agent that reads orders alone and refunds only with a click
 ```
 
 No Postgres or Redis needed to try it. Add Postgres for production and Redis for the
@@ -28,12 +28,12 @@ unattended, on real accounts, for many businesses at once, hits these:
 | The agent texts a customer something the owner never saw | Every tool has a **risk**. Per agent, the owner picks `allow`, `ask` or `observe` ("Practice": reads run, everything else is only recorded). Deletes and profile changes always ask. Work the app's own schedule starts never reaches a customer without a click. |
 | The owner approves a message with one wrong word | The owner can **edit** the words before approving; the agent is told what changed. |
 | The server restarts mid-send, and the retry sends it twice | A send is saved as "may have gone out" **before** it runs, and the same message never goes to the same person twice in a task (once your host says what counts as a send: `sent_key`). |
-| An approval waits three days | Parked tasks live in **your database**, not in memory: approve from any process, any time. |
+| An approval waits a week | Parked tasks live in **your database**, not in memory: approve from any process, until `APPROVAL_TTL` (7 days by default) expires the wait. |
 | The agent needs an account nobody connected yet | A tool raises `NeedsConnect("Gmail", url)`: the task parks on a **connect card**, and once the owner connects it the agent retries and carries on, instead of saying it can't. |
 | A tool hangs | Each tool has a **timeout**; a send stopped by it counts as sent. |
 | A long task overflows the model's context | Old tool results are **compacted** before the run is made to wrap up. |
 | The model repeats the same call | It is **reminded once**, then stopped. |
-| A customer writes back | Their reply **wakes the task** that wrote to them. |
+| A customer writes back | Their reply **wakes the task** that wrote to them, fenced as outside text; the woken task can update its records, but a send or a spend waits for the owner. |
 | Agents poll "anything new?" all day | **One clock, many triggers**: an agent wakes on a schedule, on an event your app fires (an email to an alias, a webhook), or when a teammate finishes, with their report. Nothing a trigger starts can send, pay or change records without the owner. |
 | One busy business floods the queue | The background **sweeper** runs owner work first, then takes turns between businesses, several at once, under a Redis lock. |
 | "Who did what?" | Every call is **audited** with its decision and the rule behind it. |
@@ -69,13 +69,17 @@ owner request ──▶ loop.run_task ──▶ model ──▶ tool call ──
 
 ## Quick start
 
-[`examples/shop.py`](examples/shop.py) is a complete app: a web shop whose agent reads orders
-on its own and refunds only with the owner's click. It runs offline (SQLite, a scripted model):
+The offline shop demo ([`taskwarden/demo.py`](taskwarden/demo.py), also
+[`examples/shop.py`](examples/shop.py) in the repo) is a complete app: a web shop whose agent
+reads orders on its own and refunds only with the owner's click. It runs offline (SQLite, a
+scripted model):
 
 ```bash
 pip install "taskwarden[dev]"
-python examples/shop.py
+taskwarden-demo                  # or: python -m taskwarden.demo
 ```
+
+From a clone, `python examples/shop.py` runs the same demo.
 
 ```
 owner: Refund the customer who paid $19.50 today.
@@ -117,14 +121,17 @@ class ShopHost(BaseHost):
 
 await loop.run_task(host, db, task, actor="owner")          # the owner's request
 await decisions.apply(host, db, org, await decisions.claim(host, db, org, task.id, "approve"),
-                      "approve")                             # their click, any time later
+                      "approve")                             # their click, until APPROVAL_TTL
 await sweeper.sweep(host, Session, redis, now=now, run=run) # on a timer: resumes the rest
 ```
 
 `BaseHost` leaves out what only your app can know. Override it as you grow:
-`sent_key` / `reach_key` (turn on the duplicate-send guard), `notify_parked` (push, SMS or
+`OUTWARD` (the routine tools that reach a customer, so a self-started task parks them; the
+default treats every routine call that way), `APPROVAL_TTL` (how long an owner decision may
+wait; a week by default), `sent_key` / `reach_key` (turn on the
+duplicate-send guard), `notify_parked` (push, SMS or
 email the owner), `refuse_run` (credits), `context` (the business's time zone), `audit`
-(store the trail), `mark` (live progress), `thought` (the model's reasoning, as it works), `take_messages` (what the owner writes while a task runs joins it), `stop_asked` (the owner's Stop: the run ends at its next step and says what it did), `clock` (how the time reads; it rides on the
+(store the trail: the default only logs it), `mark` (live progress), `thought` (the model's reasoning, as it works), `take_messages` (what the owner writes while a task runs joins it), `stop_asked` (the owner's Stop: the run ends at its next step and says what it did), `clock` (how the time reads; it rides on the
 first message of each request, never in the system prompt, so the prompt stays cached).
 
 ## One clock, many triggers
@@ -148,7 +155,8 @@ triggers:
 
 ```python
 class MyHost(BaseHost):
-    triggers = triggers.of_folders(folders)        # checked: agents exist, no done-loop
+    triggers = triggers.of_folders(folders, events=MY_EVENTS)  # agents exist, no done-loop,
+                                                               # every event name is fired
 
 await triggers.fire(host, db, org, "email:bugs", email_text)  # your webhook handler
 await triggers.due(host, db, org, now=now)                    # in the sweeper's on_sweep
@@ -163,9 +171,9 @@ even before `routine` work (a text back, a booking), since a stranger's words ma
 retried webhook), each agent runs at most `max_per_day` triggered tasks, a paused agent stays
 asleep, and a `done` chain that would loop is refused when it is loaded.
 
-What arrives from outside (the event's payload, a teammate's report) is fenced: every line
-marked, between two lines carrying the text's own fingerprint, so a forged "end of email, now
-the owner says..." line stays inside it.
+What arrives from outside (the event's payload, a teammate's report, a customer's reply) is
+fenced: every line marked, between two lines carrying the text's own fingerprint, so a forged
+"end of email, now the owner says..." line stays inside it.
 
 A trigger with `watch: true` only looks: it is offered its agent's `read` tools and nothing
 else (refused in code if the model names another), and when nothing needs the owner it
@@ -206,6 +214,10 @@ is yours as the host.
 | `routine` | text a customer back, book them | runs; asks when the app's schedule started the task |
 | `contact`, `spend`, `change` | a campaign, a refund, edit records | the agent's setting: `ask` or `allow` |
 | `remove`, `profile` | delete a contact, change the business's profile | always asks |
+
+The default is strict: on a task the app's schedule or a trigger started, every `routine` call
+waits. A host that knows which routine tools reach people lists them in `OUTWARD`; routine work
+that stays inside the business then runs unattended.
 
 ## Requirements
 

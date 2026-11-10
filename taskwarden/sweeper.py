@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 LOCK_KEY = "team_sweeper:lock"
 STALE_AFTER = timedelta(minutes=10)
+# How long a task may wait on a person (the owner's approval or answer, a teammate's answer)
+# before the sweeper expires it. A host overrides `BaseHost.APPROVAL_TTL` to change it.
 EXPIRE_AFTER = timedelta(days=7)
 MAX_ATTEMPTS = 3
 BATCH_SIZE = 10
@@ -49,8 +51,9 @@ async def retry_or_fail(host, db, task: Any) -> None:
 
 async def expire_and_recover(host, db, now: datetime) -> None:
     Task = host.Task
+    ttl = getattr(host, "APPROVAL_TTL", EXPIRE_AFTER) or EXPIRE_AFTER
     expired = (await db.execute(select(Task).where(
-        Task.status == "waiting", Task.updated_at < now - EXPIRE_AFTER))).scalars().all()
+        Task.status == "waiting", Task.updated_at < now - ttl))).scalars().all()
     for t in expired:
         # An ask parked on a teammate timed out; an approval or question timed out on the owner.
         why = ("I never got an answer, so I stopped" if (t.pending or {}).get("kind") == "ask_agent"

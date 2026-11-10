@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.0 (2026-11-09)
+
+- `BaseHost.OUTWARD`: the routine tools that reach a customer. `BaseHost.decide` now passes it
+  to `gate.decide`, so a task the app's schedule started parks a routine text or booking for
+  the owner's click, not only `contact`/`spend`/`change`. The default (`None`) treats every
+  routine call as reaching someone; a host that knows its customer-facing routine tools lists
+  them and lets the rest of its routine work run unattended. A host that overrides `decide`
+  keeps its own policy.
+- `taskwarden-demo`: the offline shop demo now ships inside the package
+  (`taskwarden/demo.py`), so `pip install "taskwarden[dev]"` then `taskwarden-demo` (or
+  `python -m taskwarden.demo`) runs it without a clone. `examples/shop.py` re-exports the same
+  demo for the repo path.
+- A customer's reply is now fenced like any other outside text (`replies.wake`), and
+  `replies.woken(task)` makes the task's later runs self-started: a reply can wake the task that
+  wrote to them, but it cannot make it send, spend or change records without the owner's click.
+  Only `note` (what they wrote) is fenced: `wake(..., about=, guidance=)` carries the host's own
+  line before it and its instructions after it, unfenced (`guidance` replaces `REPLY_GUIDANCE`).
+- An approved call is re-checked against practice mode as well as a pause: an agent switched to
+  `observe` while the owner was deciding does not run. An approval whose call id is already in
+  `task.contacted` is refused as a duplicate instead of sending twice, and a corrupt approval
+  with no call behind it fails instead of queueing a phantom answer.
+- `gate.decide` fails closed on an `AgentState.setting` it does not know (`unknown_setting`).
+- `Tool` validates `risk` against `tools.RISKS` and requires a positive `timeout` when it is
+  declared, so a mistyped risk fails at import rather than silently at the gate.
+- `triggers.check(..., events=...)` / `triggers.of_folders(folders, events=...)` can validate
+  every `event` name against the names the app actually fires; `folders.load_agent` validates
+  `skills_on_demand`, `business_types` and the agenda's cadence, weekday, goal and skills.
+- `BaseHost.APPROVAL_TTL`: how long a parked task may wait before the sweeper expires it
+  (`None` = `sweeper.EXPIRE_AFTER`, 7 days). Docs no longer say an approval waits "any time".
+- A watch task is no longer offered `use_skill`: watch reads, and nothing else.
+
 ## 0.6.1 (2026-11-09)
 
 - PyPI / package one-liner: approvals-and-audit pitch, SQLite to try — no longer ends on

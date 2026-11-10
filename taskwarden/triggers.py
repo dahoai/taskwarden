@@ -23,7 +23,8 @@ Declared in AGENT.md (`when`, not `on`: YAML reads a bare `on` as true):
         watch: true
         goal: The status page changed. Say if any customer is affected.
 
-A host lists them as `triggers` (`triggers.of_folders(folders)`), and may add the ones an agent
+A host lists them as `triggers` (`triggers.of_folders(folders, events=...)`, which also checks
+every event name against the ones the app fires), and may add the ones an agent
 set up itself (`custom_triggers(db, organization_id)`, saved through `routine_tool`). A host
 with neither starts nothing.
 
@@ -167,14 +168,22 @@ def as_dict(trigger: Trigger) -> dict:
     return out
 
 
-def check(triggers: Iterable[Trigger], agent_ids: Iterable[str]) -> None:
-    """Every agent named exists, and no `done` chain comes back to where it started (a loop of
-    agents waking each other forever). Raises ValueError."""
+def check(triggers: Iterable[Trigger], agent_ids: Iterable[str],
+          events: Optional[Iterable[str]] = None) -> None:
+    """Every agent named exists, every event named is one the app fires (`events`; pass None to
+    skip that check), and no `done` chain comes back to where it started (a loop of agents
+    waking each other forever). Raises ValueError."""
     triggers, known = list(triggers), set(agent_ids)
     for t in triggers:
         for name in (t.agent_id, t.after):
             if name is not None and name not in known:
                 raise ValueError(f"trigger for {t.agent_id}: unknown agent {name!r}")
+    if events is not None:
+        fired = frozenset(events)
+        for t in triggers:
+            if t.when == EVENT and t.event not in fired:
+                raise ValueError(f"trigger for {t.agent_id}: unknown event {t.event!r} "
+                                 f"(the app fires {sorted(fired)})")
     # An agent's several schedules are told apart by how their goals start (`due`).
     goals: dict[str, list[str]] = {}
     for t in triggers:
@@ -198,11 +207,12 @@ def check(triggers: Iterable[Trigger], agent_ids: Iterable[str]) -> None:
             raise ValueError(f"{t.agent_id} following {t.after} makes a loop")
 
 
-def of_folders(folders: Iterable[Any]) -> tuple[Trigger, ...]:
-    """Every folder's triggers, checked together."""
+def of_folders(folders: Iterable[Any], events: Optional[Iterable[str]] = None) -> tuple[Trigger, ...]:
+    """Every folder's triggers, checked together. `events`: the names the app fires, so an
+    event trigger for a name nothing ever sends fails when the team loads, not silently later."""
     folders = list(folders)
     out = tuple(t for f in folders for t in f.triggers)
-    check(out, [f.id for f in folders])
+    check(out, [f.id for f in folders], events)
     return out
 
 

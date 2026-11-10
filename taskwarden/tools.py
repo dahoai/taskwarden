@@ -74,6 +74,14 @@ class Tool:
     # Seconds before the call is stopped; None for no limit.
     timeout: Optional[float] = TOOL_TIMEOUT_SECONDS
 
+    def __post_init__(self) -> None:
+        # A mistyped risk ("roudine") would otherwise reach the gate as an unknown tier and be
+        # denied only once a task calls it. Fail where the tool is declared instead.
+        if self.risk not in RISKS:
+            raise ValueError(f"{self.name}: risk is one of {RISKS}, not {self.risk!r}")
+        if self.timeout is not None and self.timeout <= 0:
+            raise ValueError(f"{self.name}: timeout is seconds above 0, or None")
+
 
 def fn_schema(name: str, description: str, properties: Optional[dict] = None,
               required: tuple[str, ...] = ()) -> dict:
