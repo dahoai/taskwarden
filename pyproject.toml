@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "taskwarden"
-version = "0.7.0"
+version = "0.8.0"
 description = "Approvals and audit for AI agents that act: tools by risk, ask/allow/observe, owner parks that survive restarts. Try on SQLite."
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "aiosqlite>=0.20"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "aiosqlite>=0.20", "asyncpg>=0.29"]
 
 [project.scripts]
 taskwarden-demo = "taskwarden.demo:run"

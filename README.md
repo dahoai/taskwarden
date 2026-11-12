@@ -201,6 +201,26 @@ and the agent is told to call it again.
 write `token_budget(db, task)` to vary it by plan or agent). Past it the run stops and the chat
 says so. Needs the `tokens` column, which `TaskColumns` has.
 
+`TASK_TOKENS = 50_000` caps one task across all its runs, so a task that keeps retrying or looping
+can't spend the whole day. Tokens, not dollars: prices change by model, and your host can turn
+tokens into dollars where it reports.
+
+## Survives deploys
+
+- A call that changes something is saved as "may have been done" before it runs, so a task
+  resumed after a crash checks instead of repeating it. `Tool(replay_safe=True)` skips that for
+  calls that are harmless twice.
+- `host.STATE_VERSION` (default 1): bump it when the shape of a task's saved state or `pending`
+  changes. A task parked under the old version goes through `host.migrate_state(task, have,
+  want)` if you write one, else it fails with a message instead of resuming wrongly.
+- `host.save_prompt(db, task, hash, text)` receives the system prompt a run used whenever it changes;
+  the task keeps the hashes in `prompt_hashes`. That is the answer to "what did the model see
+  when it sent that?".
+- `triggers.fire(..., request_id=)` takes the provider's delivery id: a retried webhook starts one
+  task. Put a unique index on `(organization_id, agent_id, request_id)` to settle two at once.
+- When a task fails, expires or is stopped, the teammate tasks it started stop too.
+- A history still too long after old tool results are cleared is summarised once per run.
+
 ## Security
 
 [SECURITY.md](SECURITY.md) lists what the code enforces, what is only a convention, and what
@@ -233,4 +253,4 @@ pytest
 
 ## License
 
-Apache-2.0. Built by [DAHO](https://perbene.ai).
+Apache-2.0. Built by [DAHO](https://daho.ai).

@@ -145,9 +145,10 @@ class Msg:
 
 def _db():
     db = MagicMock()
-    db.execute = AsyncMock(return_value=SimpleNamespace(scalar=lambda: 0,
+    none = SimpleNamespace(all=lambda: [])
+    db.execute = AsyncMock(return_value=SimpleNamespace(scalar=lambda: 0, scalars=lambda: none,
                                                         scalar_one_or_none=lambda: None))
-    db.flush, db.commit = AsyncMock(), AsyncMock()
+    db.flush, db.commit, db.refresh = AsyncMock(), AsyncMock(), AsyncMock()
     return db
 
 
@@ -246,6 +247,26 @@ async def test_a_send_is_saved_as_maybe_sent_before_it_runs_and_a_resumed_run_do
     assert await loop.run_task(host, db, task, llm=(llm, "m")) == "done"
     assert any(m.get("role") == "tool" and m["content"].startswith(
         "Refused: you already messaged this person") for m in task.state)
+
+
+async def test_any_change_is_saved_as_maybe_done_before_it_runs_unless_it_is_replay_safe():
+    for safe, expected in ((False, loop.MAYBE_DONE), (True, None)):
+        host, task, db = ShopHost(), _task(), _db()
+        host.agent = lambda agent_id: Agent(agent_id, "Lead", tools=("read_orders", "note"))
+        host.tools["note"] = tools.Tool("note", tools.ROUTINE, tools.fn_schema("note", "Save a note"),
+                                        _text, replay_safe=safe)
+        saved = {}
+
+        async def crash(tool, ctx, args):
+            saved["state"] = list(task.state)
+            raise SystemExit  # the process dies mid-call
+        host.execute = crash
+        try:
+            await loop.run_task(host, db, task, llm=(_llm(Msg(calls=[("note", {})])), "m"))
+        except SystemExit:
+            pass
+        last = saved["state"][-1] if saved["state"] else {}
+        assert (last.get("content") if last.get("role") == "tool" else None) == expected
 
 
 # ── A tool that hangs is stopped, and a stopped send still counts as sent ──
@@ -374,6 +395,13 @@ async def test_a_missing_account_found_by_the_check_parks_before_any_approval_ca
     assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "waiting"
     assert task.pending["kind"] == "connect" and task.pending["tool"] == "refund"
     assert host.told == ["connect"]
+
+
+async def test_the_task_is_reloaded_after_a_missing_account_rolled_the_session_back():
+    host, task, db = _mailbox_host([]), _task(), _db()
+    llm = _llm(Msg(calls=[("read_inbox", {})]))
+    await loop.run_task(host, db, task, llm=(llm, "m"))
+    db.refresh.assert_awaited_with(task)  # expired attributes load here, never lazily in sync code
 
 
 async def test_a_task_that_cant_wait_is_told_the_account_is_missing_instead_of_parking():
@@ -653,3 +681,90 @@ async def test_an_approval_with_no_call_behind_it_fails_instead_of_queuing_a_pha
     await decisions.apply(host, db, "shop1", task, "approve")
     assert (task.status, task.pending) == ("failed", None)
     assert host.posted[-1]["body"] == decisions.EMPTY_APPROVAL
+
+
+# ── What the model saw, and tasks that outlive a deploy ──
+
+class ShopTask(Base, TaskColumns):
+    __tablename__ = "shop_tasks_v2"  # same columns: prompt_hashes and state_version come with the mixin
+
+
+def _stamped(**kw):
+    return ShopTask(id=uuid.uuid4(), organization_id="shop1", agent_id="lead", thread="team",
+                    goal="How are orders today?", status="running", state=[], attempts=1,
+                    pending=None, contacted=[], origin="owner", prompt_hashes=[], **kw)
+
+
+async def test_the_system_prompt_a_run_used_is_hashed_on_the_task_and_saved_once_per_change():
+    host, task, saved = ShopHost(), _stamped(), {}
+
+    async def save(db, t, h, text):
+        saved[h] = text
+    host.save_prompt = save
+    await loop.run_task(host, _db(), task, llm=(_llm(Msg("Done.")), "m"))
+    [h] = task.prompt_hashes
+    assert saved == {h: "You run a small shop's orders."}
+    task.status = "running"
+    await loop.run_task(host, _db(), task, llm=(_llm(Msg("Done.")), "m"))
+    assert task.prompt_hashes == [h] and len(saved) == 1  # the same prompt is not saved again
+    host.system_prompt = AsyncMock(return_value="A new rule.")
+    task.status = "running"
+    await loop.run_task(host, _db(), task, llm=(_llm(Msg("Done.")), "m"))
+    assert len(task.prompt_hashes) == 2 and len(saved) == 2
+
+
+async def test_a_task_saved_under_another_state_version_is_stopped_or_migrated():
+    host = ShopHost()
+    parked = _stamped(state_version=1)
+    parked.state, parked.status = [{"role": "user", "content": "go"}], "running"
+    host.STATE_VERSION = 2
+    assert await loop.run_task(host, _db(), parked, llm=(_llm(), "m")) == "failed"
+    assert "started before an update" in host.posted[-1]["body"]
+
+    migrated = _stamped(state_version=1)
+    migrated.state = [{"role": "user", "content": "go"}]
+
+    async def migrate(task, have, want):
+        task.goal = f"migrated {have}->{want}"
+    host.migrate_state = migrate
+    assert await loop.run_task(host, _db(), migrated, llm=(_llm(Msg("Ok.")), "m")) == "done"
+    assert (migrated.goal, migrated.state_version) == ("migrated 1->2", 2)
+
+    fresh = _stamped()  # never stamped: runs, and is stamped
+    assert await loop.run_task(host, _db(), fresh, llm=(_llm(Msg("Ok.")), "m")) == "done"
+    assert fresh.state_version == 2
+
+
+# ── A long task is summarised before it is made to wrap up ──
+
+async def test_a_history_too_long_even_after_compacting_is_summarised_once(monkeypatch):
+    monkeypatch.setattr(loop, "MAX_HISTORY_CHARS", 1500)
+    host, task = ShopHost(), _task()
+    task.state = [{"role": "user", "content": "Audit every order."}] + [
+        {"role": "assistant" if i % 2 else "user", "content": f"step {i} " + "x" * 90} for i in range(20)]
+    llm = _llm(Msg(calls=[("read_orders", {})]), Msg("Earlier: audited 20 orders, A7 refunded."),
+               Msg("All audited."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    notes = [m["content"] for m in task.state if m.get("role") == "user"
+             and str(m.get("content")).startswith(loop.SUMMARY_NOTE)]
+    assert notes == [loop.SUMMARY_NOTE + "Earlier: audited 20 orders, A7 refunded."]
+    assert task.state[0]["content"] == "Audit every order."  # the goal stays
+    assert host.posted[-1] == {"body": "All audited."}
+
+
+async def test_a_summary_never_splits_a_tool_result_from_its_call_and_a_failure_changes_nothing():
+    call = {"id": "k", "type": "function", "function": {"name": "read_orders", "arguments": "{}"}}
+    history = ([{"role": "user", "content": "go"}]
+               + [{"role": "assistant", "content": "x"}] * 10
+               + [{"role": "assistant", "content": None, "tool_calls": [call]},
+                  {"role": "tool", "tool_call_id": "k", "content": "2 orders"}]
+               + [{"role": "assistant", "content": "y"}] * 6)  # the 8th from the end is the tool result
+    ok = _llm(Msg("Done so far."))
+    out = await loop.summarize(ok, "m", ShopHost(), _task(), loop.Usage(), history)
+    tail = out[2:]
+    assert tail[0].get("tool_calls") and tail[1]["tool_call_id"] == "k"  # the pair stayed together
+
+    async def boom(**kw):
+        raise RuntimeError("down")
+    broken = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=boom)))
+    assert await loop.summarize(broken, "m", ShopHost(), _task(), loop.Usage(), history) == history

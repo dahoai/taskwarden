@@ -35,6 +35,17 @@ class TaskColumns:
     contacted: Mapped[list] = mapped_column(_JSON, nullable=False, default=list)
     # Model tokens (in and out) across every run of the task: what a daily budget sums.
     tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # The caller's own id for the event that started this task (a webhook's delivery id): the
+    # same one twice starts one task. Add a unique index on (organization_id, agent_id,
+    # request_id) so even two deliveries in the same instant cannot both land.
+    # The version of the app's task state this task was saved under (host.STATE_VERSION): a task
+    # parked before a deploy that changed the shape of its state is migrated or stopped, not
+    # resumed wrongly. None = not stamped yet, treated as current.
+    state_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Short hashes of the system prompts this task ran under, oldest first (the last 20): with
+    # host.save_prompt, "what did the model see when it sent that?" has an answer.
+    prompt_hashes: Mapped[list] = mapped_column(_JSON, nullable=False, default=list)
+    request_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())

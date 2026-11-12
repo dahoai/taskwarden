@@ -43,6 +43,12 @@ class Host(Protocol):
     async def token_budget(self, db: Any, task: Any) -> Optional[int]:
         """Tokens this task's agent may use in a day, or None for no cap. Optional; needs the
         `tokens` column on Task. Past it, the run stops and the chat says so (OVER_BUDGET)."""
+    async def save_prompt(self, db: Any, task: Any, prompt_hash: str, text: str) -> None:
+        """Optional. The system prompt a run used, when it differs from the task's last one
+        (needs `prompt_hashes` on Task). Store it by hash: it is what the model saw."""
+    async def migrate_state(self, task: Any, have: int, want: int) -> None:
+        """Optional. Bring a task saved under STATE_VERSION `have` up to `want`, in place.
+        Without it such a task fails with a message."""
     async def llm(self, db: Any, organization_id: str) -> tuple[Any, str]:
         """(an OpenAI-compatible async client, model name)."""
     def extra_body(self, model: str) -> Optional[dict]: ...
@@ -146,6 +152,8 @@ class BaseHost:
                                "them. Put it in your report.")
     OUT_OF_STEPS = "I ran out of steps before finishing. Ask me to carry on."
     DAILY_TOKENS: Optional[int] = None  # each agent's daily token budget; None = no cap
+    STATE_VERSION: int = 1  # bump when the shape of a task's saved state or pending changes
+    TASK_TOKENS: Optional[int] = None  # one task's token ceiling across all its runs; None = no cap
     # The ROUTINE tools that reach a customer (a text back, a booking): a task the app's
     # schedule started parks them for the owner's click, like contact/spend/change. None = the
     # host hasn't said, so every ROUTINE call is treated as reaching someone (safe by default);

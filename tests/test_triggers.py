@@ -1,6 +1,7 @@
 """Triggers: what wakes an agent besides the owner, on a real (SQLite) database."""
 import pathlib
 import sys
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -58,12 +59,21 @@ class Host(BaseHost):
         return SimpleNamespace(db=db, organization_id=organization_id, timezone="America/Toronto"), {}
 
 
-@pytest.fixture
-async def Session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+@pytest.fixture(params=["sqlite", "postgres"])
+async def Session(request):
+    """The same tests on SQLite, and on Postgres when TASKWARDEN_TEST_PG_URL names a throwaway
+    database (postgresql+asyncpg://...): a host on either must behave the same."""
+    if request.param == "sqlite":
+        url = "sqlite+aiosqlite:///:memory:"
+    elif not (url := os.environ.get("TASKWARDEN_TEST_PG_URL")):
+        pytest.skip("set TASKWARDEN_TEST_PG_URL to run on Postgres")
+    engine = create_async_engine(url)
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     yield async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()
 
 
@@ -140,6 +150,32 @@ async def test_an_event_wakes_its_agent_once_with_the_payload(Session):
     assert (task.agent_id, task.origin, task.status, task.thread) == ("inbox", "trigger", "queued", "inbox")
     assert task.goal == "Triage it.\n\n" + triggers.fenced("Blank page on iOS", "what email:bugs sent")
     assert host.self_started(task)  # its sends wait for the owner
+
+
+async def test_the_same_delivery_id_twice_starts_one_task_even_with_other_words(Session):
+    host = Host(triggers=(T("inbox", when="event", event="email:bugs", goal="Triage it."),))
+    async with Session() as db:
+        first = await triggers.fire(host, db, "org", "email:bugs", "Blank page", request_id="evt_1")
+        again = await triggers.fire(host, db, "org", "email:bugs", "Blank page (retry, new footer)",
+                                    request_id="evt_1")
+        next_one = await triggers.fire(host, db, "org", "email:bugs", "Crash on login", request_id="evt_2")
+        assert (len(first), again, len(next_one)) == (1, [], 1)
+        assert len(await tasks(db)) == 2
+
+
+async def test_a_unique_index_settles_two_deliveries_at_the_same_instant(Session):
+    from sqlalchemy import text
+    host = Host(triggers=(T("inbox", when="event", event="email:bugs", goal="Triage it."),))
+    async with Session() as db:
+        await db.execute(text("CREATE UNIQUE INDEX one_delivery ON trigger_tasks "
+                              "(organization_id, agent_id, request_id)"))
+        [t] = await triggers.fire(host, db, "org", "email:bugs", "A", request_id="evt_1")
+        # The racing twin passed the read check before the first insert landed: only the index stops it.
+        twin = await triggers._queue(host, db, "org", T("inbox", when="event", event="e", goal="x"),
+                                     "other words", "trigger", datetime.now(timezone.utc),
+                                     once_a_day=False, request_id="evt_1")
+        assert twin is None
+        assert len(await tasks(db)) == 1
 
 
 async def test_a_paused_agent_sleeps_and_a_busy_one_stops_at_its_cap(Session):
@@ -498,6 +534,24 @@ async def test_a_daily_token_budget_stops_the_agent_and_says_so(Session):
         assert await loop.run_task(host, db, other) == "done"  # each agent has its own
 
 
+async def test_a_task_token_ceiling_stops_that_task_only(Session):
+    host = WatchHost()
+    host.TASK_TOKENS = 1500
+    host.model = _recording(host, Reply(calls=[call("look")]), Reply(calls=[call("look")]), Reply("Done."))
+    async with Session() as db:
+        task = Task(id=uuid.uuid4(), organization_id="org", agent_id="inbox", thread="inbox", goal="Check.",
+                    origin="owner", state=[], contacted=[], status="running", attempts=1)
+        db.add(task)
+        assert await loop.run_task(host, db, task) == "failed"
+        assert (len(host.seen), task.tokens) == (2, 2000)
+        assert host.posted == ["Inbox used the 1500 tokens this task may spend, so it stops here."]
+        other = Task(id=uuid.uuid4(), organization_id="org", agent_id="inbox", thread="inbox", goal="Again.",
+                     origin="owner", state=[], contacted=[], status="running", attempts=1)
+        host.model = _recording(host, Reply("Hello."))
+        db.add(other)
+        assert await loop.run_task(host, db, other) == "done"  # a new task starts fresh
+
+
 async def test_a_watch_schedule_is_marked_watch_whatever_the_hosts_origin(Session):
     host = Host(triggers=(T("scout", when="schedule", goal="Look", watch=True),))
     async with Session() as db:
@@ -566,3 +620,42 @@ async def test_a_parked_task_expires_after_the_hosts_approval_ttl(Session):
         host.APPROVAL_TTL = timedelta(hours=1)
         await sweeper.expire_and_recover(host, db, now)
         assert custom.status == "failed"  # the host's shorter wait
+
+
+# ── An ended task takes its teammates' work with it ──
+
+async def test_a_task_that_fails_or_expires_stops_the_teammates_it_started(Session):
+    from taskwarden import sweeper
+    host = Host()
+    now = datetime.now(timezone.utc)
+
+    def mk(status, parent=None, **kw):
+        return Task(id=uuid.uuid4(), organization_id="org", agent_id="scout", thread="t", goal="g",
+                    origin="owner", state=[], contacted=[], status=status, attempts=0,
+                    parent_id=parent, **kw)
+    async with Session() as db:
+        top = mk("waiting", pending={"kind": "ask_agent"}, updated_at=now - timedelta(days=8))
+        queued, parked, done = mk("queued", top.id), mk("waiting", top.id), mk("done", top.id)
+        db.add_all([top, queued, parked, done])
+        await db.flush()
+        grandchild = mk("queued", parked.id)
+        db.add(grandchild)
+        await db.commit()
+        await sweeper.expire_and_recover(host, db, now)
+        assert (top.status, queued.status, parked.status, grandchild.status, done.status) == (
+            "failed", "stopped", "stopped", "stopped", "done")
+
+
+async def test_a_child_stops_before_acting_when_its_asker_has_ended(Session):
+    class Quiet(Host):
+        async def system_prompt(self, *a, **k):
+            return "You are Scout."
+    host = Quiet()
+    async with Session() as db:
+        top = Task(id=uuid.uuid4(), organization_id="org", agent_id="chief", thread="t", goal="g",
+                   origin="owner", state=[], contacted=[], status="failed", attempts=3)
+        kid = Task(id=uuid.uuid4(), organization_id="org", agent_id="scout", thread="t", goal="q",
+                   origin="owner", state=[], contacted=[], status="running", attempts=1, parent_id=top.id)
+        db.add_all([top, kid])
+        await db.commit()
+        assert await loop.run_task(host, db, kid, llm=(object(), "m")) == "stopped"

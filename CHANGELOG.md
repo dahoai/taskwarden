@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0 (2026-11-12)
+
+Adds columns to `TaskColumns`: `request_id`, `state_version`, `prompt_hashes` (a host with its own
+table adds them; the loop skips a feature whose column is missing).
+
+- Crash safety for every change, not only sends: a non-read call is saved as "may have been done"
+  before it runs (`MAYBE_DONE`), so a resumed run checks instead of repeating a refund or a
+  booking. `Tool(replay_safe=True)` opts out for calls that are harmless twice.
+- `TASK_TOKENS`: a ceiling on one task's tokens across all its runs.
+- `triggers.fire(..., request_id=)`: the same delivery id twice starts one task (a unique index on
+  `(organization_id, agent_id, request_id)` settles two at the same instant).
+- A task that fails, expires or is stopped stops the teammate tasks it started, and a child that was
+  mid-run stops when its next run starts (`cancel_children`).
+- `host.save_prompt(db, task, hash, text)`: the system prompt a run used, saved when it changes; the
+  task keeps the hashes (`prompt_hashes`), so "what did the model see?" has an answer.
+- `host.STATE_VERSION` / `migrate_state`: a task saved under another version is migrated or stopped
+  with a message, never resumed on a state of the wrong shape.
+- A history still too long after clearing old tool results is summarised once per run (the goal and
+  the latest 8 messages stay whole) before the run is made to wrap up.
+- The trigger tests run on Postgres too when `TASKWARDEN_TEST_PG_URL` is set.
+
 ## 0.7.0 (2026-11-09)
 
 - `BaseHost.OUTWARD`: the routine tools that reach a customer. `BaseHost.decide` now passes it

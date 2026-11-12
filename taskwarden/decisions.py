@@ -13,8 +13,8 @@ from typing import Any, Optional
 from sqlalchemy import select, update
 
 from . import gate
-from .loop import MAYBE_SENT, pending_calls, tool_msg
-from .tools import NeedsConnect
+from .loop import MAYBE_DONE, MAYBE_SENT, pending_calls, tool_msg
+from .tools import READ, NeedsConnect
 
 # What a parked call reads when the owner wrote in the chat instead of approving it.
 REVISE_RESULT = ("Not done yet: the owner replied instead of approving: \"{change}\". If it "
@@ -177,6 +177,9 @@ async def apply(host, db, organization_id: str, task: Any, decision: str, *,
                 # second send when the task is retried.
                 task.state = answered(task.state or [], [tool_msg(call.get("tool_call_id", ""), MAYBE_SENT)])
                 task.contacted = sorted(sent | {key})
+                await db.commit()
+            elif tool.risk != READ and not tool.replay_safe:
+                task.state = answered(task.state or [], [tool_msg(call.get("tool_call_id", ""), MAYBE_DONE)])
                 await db.commit()
             try:
                 out, ok, _ = await host.execute(tool, ctx, call.get("args") or {})

@@ -73,6 +73,9 @@ class Tool:
     check: Optional[Callable[..., Awaitable[Optional[str]]]] = None
     # Seconds before the call is stopped; None for no limit.
     timeout: Optional[float] = TOOL_TIMEOUT_SECONDS
+    # True when running it twice does no harm ("set status to X"): a crash mid-call then reruns
+    # it instead of asking the model to check first. Reads never need it.
+    replay_safe: bool = False
 
     def __post_init__(self) -> None:
         # A mistyped risk ("roudine") would otherwise reach the gate as an unknown tier and be

@@ -11,6 +11,7 @@ the Host (taskwarden.host).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -61,6 +62,7 @@ UNFINISHED = ("You said what you will do next but called no tool, so nothing hap
 QUIET = "NOTHING_TO_REPORT"
 WATCH_REFUSED = "Refused: you are only watching. Say in your report what should be done."
 OVER_BUDGET = "{name} has used today's budget of {limit} tokens, so this stops here until tomorrow."
+TASK_OVER_BUDGET = "{name} used the {limit} tokens this task may spend, so it stops here."
 WATCHING = ("You are only watching: you can read, nothing else. If nothing here needs the "
             f"owner, reply with exactly {QUIET}. Otherwise tell them, briefly, what needs them.")
 _ANNOUNCES = re.compile(r"\b(?:let me|i'll|i will|i'm going to|je vais|laissez-moi|voy a|déjame)\b",
@@ -77,6 +79,10 @@ MAX_ASK_DEPTH = 2  # a task this deep in a hand-off chain answers; it cannot han
 # reads this instead of sending again, and the duplicate guard knows the message.
 MAYBE_SENT = ("Unknown: the run stopped while this was being sent, so it may have gone out. "
               "Check before sending it again.")
+# The same for any other call that changes something (a refund, a booking, a record): saved
+# before it runs, so a resumed run checks instead of doing it again.
+MAYBE_DONE = ("Unknown: the run stopped while this was running, so it may have been done. "
+              "Check before doing it again.")
 # A call the run never reached before it stopped (a restart mid-round).
 NOT_RUN = "Not run: the run stopped before this call. Call it again if it is still needed."
 # What a call made in practice reads: not run, and the report says what would have been done.
@@ -308,18 +314,21 @@ async def _delegate(host, db, parent: Any, args: dict, teammates: list, states: 
     return f"Queued for {host.agent(agent_id).name}.", True
 
 
-async def _ancestors(host, db, task: Any) -> list[str]:
-    """Agents up the hand-off chain, nearest first: they are all waiting on this task."""
+async def _ancestors(host, db, task: Any) -> tuple[list[str], Optional[str]]:
+    """(agents up the hand-off chain, nearest first: they are all waiting on this task; and the
+    nearest one's status, so a task whose asker has already ended can stop before it acts)."""
     Task = host.Task
-    out, cur = [], task
+    out, cur, nearest = [], task, None
     while cur.parent_id and len(out) < MAX_ASK_DEPTH + 3:
         cur = (await db.execute(select(Task).where(
             Task.id == cur.parent_id, Task.organization_id == task.organization_id
         ))).scalar_one_or_none()
         if cur is None:
             break
+        if not out:
+            nearest = cur.status
         out.append(cur.agent_id)
-    return out
+    return out, nearest
 
 
 async def _ask_agent(host, db, parent: Any, target: str, question: str, states: dict,
@@ -384,6 +393,68 @@ async def asked_to_stop(host, task: Any) -> bool:
     return bool(check is not None and await check(task))
 
 
+STATE_OLD = ("{name} stopped: this task was started before an update and can't continue. "
+             "Ask again to start it fresh.")
+
+
+async def check_state_version(host, db, task: Any) -> bool:
+    """A task saved under another `host.STATE_VERSION` (its parked approval or state may have a
+    different shape) goes through `host.migrate_state(task, have, want)` if the host has one,
+    else it fails and says so. A task with no version yet is stamped and runs. Needs the
+    `state_version` column; without it nothing is checked."""
+    if not hasattr(task, "state_version"):
+        return True
+    want, have = getattr(host, "STATE_VERSION", 1), task.state_version
+    if have is not None and have != want and (task.state or task.pending):
+        migrate = getattr(host, "migrate_state", None)
+        if migrate is None:
+            task.status, task.pending = "failed", None
+            host.post_message(db, organization_id=task.organization_id, thread=task.thread,
+                              sender=task.agent_id, body=getattr(host, "STATE_OLD", STATE_OLD).format(
+                                  name=host.agent(task.agent_id).name),
+                              task_id=task.id)
+            await answer_ask(host, db, task, "no answer (it was started before an update)")
+            await cancel_children(host, db, task)
+            await db.commit()
+            return False
+        await migrate(task, have, want)
+    task.state_version = want
+    return True
+
+
+async def record_prompt(host, db, task: Any, system: str) -> None:
+    """Remember which system prompt this run used: a short hash on the task, and the text itself
+    through `host.save_prompt(db, task, hash, text)` when the host has one. Only a change is saved."""
+    if not hasattr(task, "prompt_hashes"):
+        return
+    h = hashlib.sha256(system.encode()).hexdigest()[:16]
+    hashes = list(task.prompt_hashes or [])
+    if hashes and hashes[-1] == h:
+        return
+    save = getattr(host, "save_prompt", None)
+    if save is not None:
+        await save(db, task, h, system)
+    task.prompt_hashes = [*hashes, h][-20:]
+
+
+async def cancel_children(host, db, task: Any) -> None:
+    """`task` ended without finishing: stop every teammate task it started that has not run
+    to the end (queued or parked), and theirs in turn. A child already running stops itself
+    at its next run (`_ancestors`). Not committed: the caller commits with the task."""
+    Task = host.Task
+    frontier = [task.id]
+    for _ in range(MAX_ASK_DEPTH + 3):
+        kids = (await db.execute(select(Task).where(
+            Task.parent_id.in_(frontier), Task.organization_id == task.organization_id,
+            Task.status.in_(("queued", "waiting", "running"))))).scalars().all()
+        if not kids:
+            return
+        for kid in kids:
+            if kid.status != "running":
+                kid.status, kid.pending = STOPPED, None
+        frontier = [k.id for k in kids]
+
+
 async def take_added(host, task: Any) -> list[dict]:
     """What the owner wrote since the last look, as user turns (host.take_messages, optional)."""
     take = getattr(host, "take_messages", None)
@@ -406,6 +477,7 @@ async def stop(host, db, task: Any, history: list, did: list[str]) -> str:
     host.post_message(db, organization_id=task.organization_id, thread=task.thread,
                       sender=task.agent_id, body=reply, task_id=task.id)
     await answer_ask(host, db, task, reply)  # a teammate waiting on this one carries on
+    await cancel_children(host, db, task)
     await db.flush()
     return STOPPED
 
@@ -485,6 +557,42 @@ def too_long(history: list) -> bool:
 KEEP_RESULTS = 6  # the latest results stay whole
 RESULT_HEAD = 500
 CLEARED = "\n[The rest was cleared to save room. Call the tool again if you need it.]"
+
+
+KEEP_TAIL = 8  # the latest messages a summary leaves whole
+SUMMARY_PROMPT = ("Summarize the work so far in under 300 words, for yourself to carry on from: what "
+                  "was asked, what was done (keep names, numbers and ids exactly), what is left.")
+SUMMARY_NOTE = "Summary of your earlier work in this task (the details were cleared to save room):\n"
+SUMMARY_INPUT_CHARS = 60_000
+
+
+async def summarize(client, model: str, host, task: Any, usage, history: list) -> list:
+    """Replace the middle of a long history with the model's own summary of it, keeping the
+    first message (the goal) and the latest KEEP_TAIL whole. The cut never separates a tool
+    result from the call that asked for it. Any failure leaves the history as it was.
+
+    ponytail: the cleared messages are gone from `task.state` (the chat and audit keep what
+    mattered); store them and add a search tool if a task ever needs them back."""
+    cut = len(history) - KEEP_TAIL
+    while cut > 1 and isinstance(history[cut], dict) and history[cut].get("role") == "tool":
+        cut -= 1
+    if cut <= 1:
+        return history
+    middle = json.dumps(seen(history[1:cut]), default=str)[-SUMMARY_INPUT_CHARS:]
+    try:
+        resp = await client.chat.completions.create(
+            model=model, extra_body=host.extra_body(model),
+            messages=[{"role": "system", "content": SUMMARY_PROMPT},
+                      {"role": "user", "content": f"The task: {history[0].get('content')}\n\n"
+                                                  f"The messages so far (JSON):\n{middle}"}])
+        spend(task, usage, resp)
+        text = host.clean_text(resp.choices[0].message.content or "")
+    except Exception:
+        logger.exception("taskwarden_summary_failed task_id=%s", task.id)
+        return history
+    if not text.strip():
+        return history
+    return [history[0], {"role": "user", "content": SUMMARY_NOTE + text}, *history[cut:]]
 
 
 def compact(history: list) -> list:
@@ -602,11 +710,13 @@ async def over_budget(host, db, task: Any) -> Optional[int]:
 
 
 async def out_of_budget(host, db, task: Any, history: list, did: list[str], name: str,
-                        limit: int) -> str:
+                        limit: int, *, per_task: bool = False) -> str:
     """The agent spent its day: the run ends (failed, so nothing retries it today), and the
     chat says so and what it had done."""
     task.state, task.pending, task.status = answer_dangling([*history]), None, "failed"
-    reply = getattr(host, "OVER_BUDGET", OVER_BUDGET).format(name=name, limit=limit)
+    words = (getattr(host, "TASK_OVER_BUDGET", TASK_OVER_BUDGET) if per_task
+             else getattr(host, "OVER_BUDGET", OVER_BUDGET))
+    reply = words.format(name=name, limit=limit)
     if did:
         reply += " " + getattr(host, "STOPPED_DID", "Done before that: {did}.").format(did="; ".join(did))
     host.post_message(db, organization_id=task.organization_id, thread=task.thread,
@@ -643,6 +753,8 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     if await host.refuse_run(db, task, actor):
         task.status = "failed"
         await db.commit()
+        return task.status
+    if not await check_state_version(host, db, task):
         return task.status
     # A trigger's task is never the owner's, whatever the host counts as self-started.
     triggered = task.origin in (triggers.SCHEDULED, triggers.TRIGGERED, triggers.WATCHED)
@@ -690,7 +802,9 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
         tools.append(skill_schema)  # a watch task reads, loads nothing, and asks no one
     if not watching:
         tools += host.local_schemas(channel, task)
-    chain = await _ancestors(host, db, task)
+    chain, asker = await _ancestors(host, db, task)
+    if asker in ("failed", STOPPED):  # nobody wants the answer any more: no sends, no spends
+        return await stop(host, db, task, history, [])
     if watching:
         pass  # no hand-offs: a teammate it woke would act
     elif never_waits:
@@ -703,6 +817,7 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     local_now = now.astimezone(ZoneInfo(ctx.timezone))
     system = {"role": "system", "content": await host.system_prompt(
         db, task, agent, name, teammates, local_now, channel, business_type, self_started, loaded)}
+    await record_prompt(host, db, task, system["content"])
     clock = getattr(host, "clock", None)
     note = clock(local_now) if clock else None
     Task = host.Task
@@ -728,12 +843,16 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     reads: dict[str, Any] = {}
     shown: list[dict] = []
     did: list[str] = []  # what this run changed or sent, for the owner if they stop it
+    summarized = False
     for round_no in range(MAX_ROUNDS):
         if await asked_to_stop(host, task):
             return await stop(host, db, task, history, did)
         history += await take_added(host, task)
         if round_no and too_long(history):
             history = compact(history)
+            if too_long(history) and not summarized:  # once a run: a second pass would eat its own summary
+                summarized = True
+                history = await summarize(client, model, host, task, usage, history)
         if round_no and stalled(history, 2) and not any(
                 m.get("content") == REPEATED for m in history if isinstance(m, dict)):
             history.append({"role": "user", "content": REPEATED})
@@ -746,6 +865,9 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
             # so the failure count starts over.
             task.state, task.status, task.attempts = list(history), "queued", 0
             return "queued"
+        if (cap := getattr(host, "TASK_TOKENS", None)) and (getattr(task, "tokens", 0) or 0) >= cap:
+            # One task's ceiling across all its runs: a loop that keeps retrying can't drain the day.
+            return await out_of_budget(host, db, task, history, did, name, cap, per_task=True)
         if limit := await over_budget(host, db, task):
             return await out_of_budget(host, db, task, history, did, name, limit)
         await host.mark(org, task.thread, agent.id, THINKING)
@@ -942,15 +1064,23 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                     task.state = [*history, tool_msg(tc.id, MAYBE_SENT)]
                     task.contacted = sorted(sent_task | {sent})
                     await db.commit()
+                elif tool is not None and tool.risk != READ and not tool.replay_safe:
+                    task.state = [*history, tool_msg(tc.id, MAYBE_DONE)]
+                    await db.commit()
                 try:
                     with capture_looks() as looked:
                         out, ok, raw = await host.execute(tool, ctx, args)
                 except NeedsConnect as e:  # nothing ran, so nothing counts as sent
+                    # The tool's rollback expired the task: reload it here, where awaiting is
+                    # allowed, or the next `task.id` lazy-loads outside the async context.
+                    await db.refresh(task)
                     parked, out = connect(tc.id, tool_name, e)
                     if out is not None:
                         history.append(tool_msg(tc.id, out))
                     continue
                 pictures += looked
+                if ok is not True:  # a timeout or failure rolled the session back
+                    await db.refresh(task)
                 if tool.risk == READ:
                     if ok and raw is not None:
                         reads[tool_name] = raw

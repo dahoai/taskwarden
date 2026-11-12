@@ -58,6 +58,7 @@ from typing import Any, Awaitable, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from .tools import PROFILE, Tool, fn_schema
 
@@ -244,13 +245,16 @@ async def _count(db, query) -> int:
 
 
 async def _queue(host, db, organization_id: str, trigger: Trigger, goal: str, origin: str,
-                 now: datetime, *, once_a_day: bool = True) -> Optional[Any]:
+                 now: datetime, *, once_a_day: bool = True,
+                 request_id: Optional[str] = None) -> Optional[Any]:
     from .loop import DAILY_TASK_CAP  # the loop's folders import reads this module
     Task = host.Task
     now = now.astimezone(timezone.utc)  # SQLite keeps a time's digits and drops its zone
     recent = select(func.count()).select_from(Task).where(
         Task.organization_id == organization_id, Task.created_at >= now - DAY)
     mine = recent.where(Task.agent_id == trigger.agent_id)
+    if request_id and await _count(db, mine.where(Task.request_id == request_id)):
+        return None  # the same delivery twice
     if once_a_day and await _count(db, mine.where(Task.goal == goal)):
         return None  # the same event twice: a retried webhook, a forwarded email
     started = Task.origin.in_({SCHEDULED, TRIGGERED, WATCHED, origin})
@@ -262,6 +266,15 @@ async def _queue(host, db, organization_id: str, trigger: Trigger, goal: str, or
     task = Task(id=uuid.uuid4(), organization_id=organization_id, agent_id=trigger.agent_id,
                 parent_id=None, thread=trigger.agent_id, goal=goal, status="queued", state=[],
                 attempts=0, origin=origin, contacted=[], created_at=now, updated_at=now)
+    if request_id:
+        task.request_id = request_id
+        try:  # the unique index, if the host has one, settles two deliveries at the same instant
+            async with db.begin_nested():
+                db.add(task)
+                await db.flush()
+        except IntegrityError:
+            return None
+        return task
     db.add(task)
     return task
 
@@ -284,15 +297,16 @@ def _with(goal: str, extra: str, source: str) -> str:
 
 
 async def fire(host, db, organization_id: str, event: str, payload: str = "", *,
-               now: Optional[datetime] = None) -> list[Any]:
+               now: Optional[datetime] = None, request_id: Optional[str] = None) -> list[Any]:
     """Something happened (`event`, a name the app chose: "email:bugs", "github:pr:42"): queue
     every agent waiting for it, with `payload` (the email, the webhook body) under its goal.
     The payload is the outside world's words: the task is self-started, so it can only read,
     draft and ask. Returns the queued tasks, committed.
 
-    ponytail: the same-event check and the insert aren't atomic, so one webhook delivered twice
-    in the same instant can queue twice; call it under a lock (or dedupe on the provider's
-    delivery id first) where that matters."""
+    `request_id`: the provider's delivery id. The same id again queues nothing (it returns []),
+    even when two arrive at the same instant if Task has the unique index its `request_id`
+    column describes. Without it, the same words within a day are dropped, but that check and
+    the insert aren't atomic."""
     now = now or datetime.now(timezone.utc)
     waiting = [t for t in await all_of(host, db, organization_id)
                if t.when == EVENT and t.event == event]
@@ -301,7 +315,8 @@ async def fire(host, db, organization_id: str, event: str, payload: str = "", *,
     _, awake = await _awake(host, db, organization_id)
     out = [task for t in waiting if t.agent_id in awake
            and (task := await _queue(host, db, organization_id, t,
-                                     _with(t.goal, payload, f"what {event} sent"), t.origin, now))]
+                                     _with(t.goal, payload, f"what {event} sent"), t.origin, now,
+                                     request_id=request_id))]
     if out:
         await db.commit()
     return out

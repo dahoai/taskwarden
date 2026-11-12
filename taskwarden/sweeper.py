@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy import case, func, select, update
 
-from .loop import answer_ask
+from .loop import answer_ask, cancel_children
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ async def retry_or_fail(host, db, task: Any) -> None:
         # Someone waiting on this task to answer them gets the failure too, rather than
         # hanging until their own wait expires.
         await answer_ask(host, db, task, f"no answer ({body})")
+        await cancel_children(host, db, task)
     else:
         task.status = "queued"
 
@@ -61,6 +62,7 @@ async def expire_and_recover(host, db, now: datetime) -> None:
         t.status, t.pending = "failed", None
         host.post_message(db, organization_id=t.organization_id, thread=t.thread,
                           sender=t.agent_id, body=f"{why}: {t.goal}", task_id=t.id)
+        await cancel_children(host, db, t)
     stale = (await db.execute(select(Task).where(
         Task.status == "running", Task.updated_at < now - STALE_AFTER))).scalars().all()
     for t in stale:

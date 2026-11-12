@@ -15,7 +15,7 @@ Almost none stop an unattended agent from texting a customer, refunding a card, 
 
 That gap is not theoretical. It is the difference between a demo that looks smart and a system you can leave running overnight.
 
-At [Perbene](https://perbene.ai), we run an AI team for real businesses: phones, SMS, WhatsApp, email, website chat. Agents wake on cron, on webhooks, and when a customer replies. Nobody is sitting on the keyboard for every action. If the harness only “asks the model to be careful,” you will eventually ship something you did not mean to ship.
+At [Perbene](https://perbene.ai), we run a team of agents for real businesses: phones, SMS, WhatsApp, email, website chat. Agents wake on cron, on webhooks, and when a customer replies. Nobody is sitting on the keyboard for every action. If the harness only “asks the model to be careful,” you will eventually ship something you did not mean to ship.
 
 So we built the gate in code.
 
@@ -83,10 +83,12 @@ If your harness does not have a named answer for each of those, you are running 
 
 Every tool carries one risk. The gate reads the risk *before* the handler runs. The model never gets a tool it was not granted. Anything unrecognised is denied. Fail closed.
 
-- **read, draft** (look up orders, write a draft): always run
-- **routine** (text a customer back, book them): runs, but asks when the task was self-started
-- **contact, spend, change** (a campaign, a refund, edit records): the agent’s setting, ask or allow
-- **remove, profile** (delete a contact, change the business): always ask
+| Risk | Examples | Rule |
+| --- | --- | --- |
+| `read`, `draft` | look up orders, write a draft | always runs |
+| `routine` | text a customer back, book them | runs, but asks when the task was self-started |
+| `contact`, `spend`, `change` | a campaign, a refund, edit records | the agent’s setting: `ask` or `allow` |
+| `remove`, `profile` | delete a contact, change the business | always asks |
 
 Per agent, the owner picks one mode:
 
@@ -177,11 +179,13 @@ This is how Perbene’s standing agenda runs: the Marketer and Salesperson wake 
 
 ## How this compares (honestly)
 
-- **Taskwarden**: a risk gate before every tool, approvals in your own database, edit before run, a built-in risk policy, sends recorded before they go out. Composition is plain: agent folders and hand-offs.
-- **LangGraph**: the best graphs. Interrupts and a checkpointer survive restarts and allow edits; the risk policy and crash-safe sends are yours to wire.
-- **HumanLayer**: the human as a channel (Slack, email), set per tool or MCP server; you wire send safety.
-- **OpenAI Agents SDK**: agents and handoffs, a `needs_approval` flag per tool, mostly approve or reject.
-- **CrewAI**: roles and crews, with review of a task’s output rather than a gate before each action.
+| | Composition | Pre-tool gate | Survives restart | Edit before run | Built-in risk policy | Crash-safe sends |
+|---|---|---|---|---|---|---|
+| **Taskwarden** | folders + hand-offs | risk gate | your DB | yes | yes | yes |
+| **LangGraph HITL** | best graphs | interrupt / middleware | checkpointer | yes | you wire it | you wire it |
+| **HumanLayer** | thin / K8s ACP | human as channel | yes | feedback | per tool / MCP | you wire it |
+| **OpenAI Agents SDK** | agents + handoffs | `needs_approval` | partial | mostly approve/reject | per tool flag | you wire it |
+| **CrewAI** | roles / crews | task output review | weak | weak | weak | no |
 
 Use LangGraph when you need arbitrary graphs and a huge ecosystem.
 
@@ -234,6 +238,6 @@ Apache-2.0. Python 3.11+. SQLite to try it. Postgres for production. Redis only 
 
 If you are shipping agents that touch money, mailboxes, or customer data: star it, break it, open an issue for whatever the gate still misses.
 
-If you found Taskwarden through this article: it came out of Perbene’s AI team, the same system that answers the phone when a business cannot.
+If you found Taskwarden through this article: it came out of Perbene, the growth desk that answers the phone when a business cannot.
 
 **PS: `pip install "taskwarden[dev]"` and run `taskwarden-demo`. The refund that needs a click is the whole pitch.**
