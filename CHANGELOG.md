@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1 (2026-11-24)
+
+- A `ToolFailed`, or a READ retried after an error, no longer rolls the session back: it is the run's own, and a rollback dropped the round's pending audit rows (a timeout still rolls back, as before).
+
 ## 0.9.0 (2026-11-24)
 
 - `tasks.tokens` counts a cached input token at `host.cached_weight(model)` of a full one (what the

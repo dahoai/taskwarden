@@ -338,6 +338,19 @@ async def test_a_failure_that_cannot_pass_is_not_retried_and_says_so(no_wait):
     assert len(calls) == 1
 
 
+async def test_a_failed_call_leaves_the_session_alone(no_wait):
+    """The run's session holds the round's audit rows: a failure must not roll them back."""
+    db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+    for risk in (tools.READ, tools.CONTACT):
+        handler, _ = _flaky(tools.ToolFailed("down.", retryable=True))
+        tool = tools.Tool("t", risk, tools.fn_schema("t", "x"), handler)
+        assert (await tools.execute(tool, SimpleNamespace(db=db), {}))[1] is False
+    handler, _ = _flaky(RuntimeError("502"))
+    await tools.execute(tools.Tool("r", tools.READ, tools.fn_schema("r", "x"), handler),
+                        SimpleNamespace(db=db), {})
+    db.rollback.assert_not_awaited()
+
+
 async def test_a_send_is_never_retried_in_code(no_wait):
     handler, calls = _flaky(tools.ToolFailed("provider down.", retryable=True))
     tool = tools.Tool("send", tools.CONTACT, tools.fn_schema("send", "x"), handler)

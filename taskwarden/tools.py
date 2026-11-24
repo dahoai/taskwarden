@@ -200,8 +200,7 @@ async def execute(tool: Tool, ctx: Any, args: dict[str, Any], *,
                                tool.name, _org(ctx), limit)
                 await _rollback(ctx)  # stopped mid-write: the session can't be trusted as it is
                 return (SLOW, False) if tool.risk == READ else (SLOW_MAYBE_DONE, None)
-            except ToolFailed as e:
-                await _rollback(ctx)
+            except ToolFailed as e:  # no rollback: the session holds the round's audit rows
                 logger.warning("team_tool_failed tool=%s organization_id=%s retryable=%s",
                                tool.name, _org(ctx), e.retryable)
                 if e.retryable and not last:
@@ -220,7 +219,6 @@ async def execute(tool: Tool, ctx: Any, args: dict[str, Any], *,
                 logger.exception("team_tool_failed tool=%s organization_id=%s", tool.name,
                                  _org(ctx))
                 if not last:  # a READ: a blip upstream often passes
-                    await _rollback(ctx)
                     await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
                     continue
                 return FAILED, False
