@@ -77,32 +77,34 @@ async def run_one(host, session_factory, task_id: Any, *, run: Callable[..., Awa
     took it first."""
     Task = host.Task
     async with session_factory() as db:
-        task = await db.get(Task, task_id)
-        if task is None:
-            return False
-        new_attempts = (task.attempts or 0) + 1
         claimed = (await db.execute(update(Task).where(
             Task.id == task_id, Task.status == "queued"
-        ).values(status="running", attempts=new_attempts)
+        ).values(status="running", attempts=func.coalesce(Task.attempts, 0) + 1)
             .returning(Task.id))).scalar_one_or_none()
         if claimed is None:
-            return False  # another worker took it
-        task.status, task.attempts = "running", new_attempts
+            return False  # another worker took it, or it is gone
+        # Loaded after the claim, never before: a reply can join a queued task (replies.wake)
+        # up to the moment it is claimed, and a state read earlier would overwrite it.
+        task = await db.get(Task, task_id)  # a fresh session: nothing cached, read from the row
         await db.commit()
         try:
             await asyncio.wait_for(run(db, task, actor="task", budget_seconds=run_budget),
                                    timeout=run_timeout)
         except Exception:
-            logger.exception("team_task_failed task_id=%s", task.id)
             # Keep the run's progress by committing first: the loop saved the task's state
             # after every round, and audit rows exist for side effects that really happened,
             # so rolling back would make a retry repeat them. Only fall back to rollback +
-            # refresh if that commit itself fails.
+            # refresh if that commit itself fails. Nothing here reads `task` before that: after
+            # a failed flush its attributes are expired and reading one raises again.
             try:
                 await db.commit()
             except Exception:
                 await db.rollback()
+                if await db.get(Task, task_id) is None:  # deleted while it ran: nothing to retry
+                    logger.warning("team_task_vanished task_id=%s", task_id)
+                    return True
                 await db.refresh(task)
+            logger.exception("team_task_failed task_id=%s", task_id)
             await retry_or_fail(host, db, task)
         await db.commit()
         return True

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import re
 import time
@@ -23,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
-from . import gate, replies, triggers
+from . import code as scripting, gate, replies, triggers
 from .folders import USE_SKILL
 from .tools import READ, ROUTINE, NeedsConnect, capture_looks
 
@@ -59,6 +60,16 @@ UNFINISHED = ("You said what you will do next but called no tool, so nothing hap
               "and do not mention this instruction.")
 # A watch task (triggers.WATCHED) reads and nothing else. These words go under its goal; a reply
 # that is exactly QUIET finishes it without a message.
+# The model's reply ended at the provider's length limit (finish_reason "length"), not because it
+# was done. A cut-off answer is half an answer; a cut-off call has broken arguments. The first is
+# asked for again, shorter, once; the second is never run.
+CUT_TEXT = ("Your last reply was cut off by the length limit, so the owner would have got half of "
+            "it. Write the whole reply again, shorter: the answer first, then only the details the "
+            "owner needs. Whatever you write next is your reply to the owner, so write it to them: "
+            "do not apologise, and do not mention this instruction.")
+CUT_TOOL = ("Not run: your reply was cut off by the length limit before this call was complete. "
+            "Make the call again with shorter arguments, or call a different tool.")
+MAX_CUT_CALLS = 2  # turns whose calls were cut off, in one run, before it wraps up instead
 QUIET = "NOTHING_TO_REPORT"
 WATCH_REFUSED = "Refused: you are only watching. Say in your report what should be done."
 OVER_BUDGET = "{name} has used today's budget of {limit} tokens, so this stops here until tomorrow."
@@ -510,7 +521,9 @@ async def park(host, db, task: Any, history: list, pending: dict, name: str, act
     # Waiting on a teammate is not the owner's business: no code, no text, no card. The
     # conversation in the thread already shows who was asked.
     internal = pending["kind"] == "ask_agent"
-    pending = {**pending, "parked_at": now.isoformat()}
+    # `rev`: this proposal's version, new at every park. A decision naming another one (a tab
+    # left open while the task resumed and parked again) is refused by decisions.claim.
+    pending = {**pending, "parked_at": now.isoformat(), "rev": uuid.uuid4().hex}
     if not internal:
         pending = {**pending, **(await host.owner_fields(db, task))}
     task.state, task.pending, task.status = history, pending, WAITING
@@ -585,7 +598,7 @@ async def summarize(client, model: str, host, task: Any, usage, history: list) -
             messages=[{"role": "system", "content": SUMMARY_PROMPT},
                       {"role": "user", "content": f"The task: {history[0].get('content')}\n\n"
                                                   f"The messages so far (JSON):\n{middle}"}])
-        spend(task, usage, resp)
+        spend(host, task, usage, resp, model)
         text = host.clean_text(resp.choices[0].message.content or "")
     except Exception:
         logger.exception("taskwarden_summary_failed task_id=%s", task.id)
@@ -670,25 +683,32 @@ class Usage:
     def __init__(self) -> None:
         self.requests = self.prompt = self.cached = self.completion = 0
 
-    def add(self, resp: Any) -> int:
-        """Count one response; returns its tokens, in and out."""
+    def add(self, resp: Any, cached_weight: float = 1.0) -> int:
+        """Count one response; returns its tokens, in and out, with each cached input token
+        counted as `cached_weight` of one (what the provider charges for it next to a miss)."""
         self.requests += 1
         u = getattr(resp, "usage", None)
         if u is None:
             return 0
         prompt = getattr(u, "prompt_tokens", 0) or 0
         completion = getattr(u, "completion_tokens", 0) or 0
+        details = getattr(u, "prompt_tokens_details", None)
+        cached = min(prompt, getattr(u, "prompt_cache_hit_tokens", 0)
+                     or getattr(details, "cached_tokens", 0) or 0)
         self.prompt += prompt
         self.completion += completion
-        details = getattr(u, "prompt_tokens_details", None)
-        self.cached += (getattr(u, "prompt_cache_hit_tokens", 0)
-                        or getattr(details, "cached_tokens", 0) or 0)
-        return prompt + completion
+        self.cached += cached
+        weight = min(max(cached_weight, 0.0), 1.0)
+        return prompt - cached + math.ceil(cached * weight) + completion
 
 
-def spend(task: Any, usage: Usage, resp: Any) -> None:
-    """Count a response against the run and the task (`tasks.tokens`, what a budget sums)."""
-    task.tokens = (getattr(task, "tokens", 0) or 0) + usage.add(resp)
+def spend(host: Any, task: Any, usage: Usage, resp: Any, model: str) -> None:
+    """Count a response against the run and the task (`tasks.tokens`, what a budget sums).
+    Cached input counts at the host's `cached_weight(model)`; a host without one counts it in
+    full."""
+    weigh = getattr(host, "cached_weight", None)
+    weight = weigh(model) if weigh is not None else 1.0
+    task.tokens = (getattr(task, "tokens", 0) or 0) + usage.add(resp, weight)
 
 
 async def over_budget(host, db, task: Any) -> Optional[int]:
@@ -814,6 +834,14 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
             tools += [DELEGATE_SCHEMA, ASK_TEAM_SCHEMA]
         else:
             tools += [ASK_TEAM_SCHEMA, ESCALATE_SCHEMA]
+    # Code mode: a script over the read tools offered here, when the host runs one for this agent.
+    scripts = (getattr(host, "code_runner", None) is not None
+               and bool(getattr(host, "code_mode", lambda a, t: False)(agent, task)))
+    if scripts and (readable := scripting.readable(
+            host.tools, {t["function"]["name"] for t in tools})):
+        tools.append(scripting.schema(readable))
+    else:
+        scripts = False
     local_now = now.astimezone(ZoneInfo(ctx.timezone))
     system = {"role": "system", "content": await host.system_prompt(
         db, task, agent, name, teammates, local_now, channel, business_type, self_started, loaded)}
@@ -834,6 +862,8 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     grounded = fresh_results(history) or (task.origin == triggers.TRIGGERED
                                           and task.parent_id is None and len(history) == 1)
     nudged = False
+    cut_text = False  # a cut-off reply was already asked for again, shorter
+    cut_calls = 0     # turns whose tool calls were cut off, never run
     # What this task has already sent, in every run of it: seeded from the row so a
     # park-and-resume cannot send the same person the same thing again.
     region = host.region(company)
@@ -875,11 +905,32 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
             model=model, extra_body=host.extra_body(model),
             messages=[system, *with_clock(history if sees_pictures(model) else seen(history), note)],
             tools=tools, tool_choice="auto")
-        spend(task, usage, resp)
+        spend(host, task, usage, resp, model)
         history = seen(history)  # the pictures were seen; they are not kept
         msg = resp.choices[0].message
         if (think := getattr(host, "thought", None)) is not None and (text := reasoning_of(msg)):
             await think(org, task.thread, agent.id, text)  # the owner can see why, as it works
+        if getattr(resp.choices[0], "finish_reason", None) == "length":
+            if msg.tool_calls:
+                # The last call's arguments end mid-way, and parse() would have made them {}: a
+                # call with nothing in it. None of this turn's calls runs.
+                logger.warning("taskwarden_calls_cut_off task_id=%s agent=%s", task.id, agent.id)
+                cut_calls += 1
+                history.append(assistant_turn(msg))
+                history += [tool_msg(tc.id, CUT_TOOL) for tc in msg.tool_calls]
+                task.state = list(history)
+                if cut_calls >= MAX_CUT_CALLS:
+                    break  # to the wrap-up below: a reply with no tools
+                continue
+            if not cut_text:
+                logger.warning("taskwarden_reply_cut_off task_id=%s agent=%s", task.id, agent.id)
+                cut_text = True
+                kept = host.clean_text(msg.content)
+                history += [*([{"role": "assistant", "content": kept}] if kept else []),
+                            {"role": "user", "content": CUT_TEXT}]
+                task.state = list(history)
+                continue
+            logger.warning("taskwarden_reply_cut_off_twice task_id=%s agent=%s", task.id, agent.id)
         if not msg.tool_calls:
             text = host.clean_text(msg.content)
             if not grounded and not nudged and states_a_figure(text):
@@ -892,6 +943,13 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                 nudged = True  # one nudge per run, whichever it was
                 history += [{"role": "assistant", "content": text},
                             {"role": "user", "content": UNFINISHED}]
+                task.state = list(history)
+                continue
+            if not nudged and (check := getattr(host, "unbacked", None)) is not None \
+                    and (note := await check(db, task, text)):
+                # The report says something was done (sent, booked) and no call behind it did.
+                nudged = True
+                history += [{"role": "assistant", "content": text}, {"role": "user", "content": note}]
                 task.state = list(history)
                 continue
             if added := await take_added(host, task):
@@ -986,12 +1044,30 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                 pending_ask["tool_call_id"] = tc.id
                 parked = pending_ask  # wait for the teammate, not the owner
                 continue
+            if tool_name == scripting.RUN_CODE and scripts:
+                if await asked_to_stop(host, task):
+                    return await stop(host, db, task, history, did)
+                await host.mark(org, task.thread, agent.id, scripting.RUN_CODE)
+                out, calls = await scripting.run(
+                    host, db, code=args.get("code"), agent=agent, state=state, task=task,
+                    ctx=ctx, offered={t["function"]["name"] for t in tools},
+                    self_started=self_started, actor=actor, reads=reads)
+                if calls:
+                    grounded = True
+                history.append(tool_msg(tc.id, out))
+                continue
             local = await host.local_call(db, org, tool_name, args, reads, shown)
             if local is not None:
                 history.append(tool_msg(tc.id, local))
                 continue
             if tool_name == USE_SKILL and agent.folder is not None:
                 out, added = host.use_skill(agent, args, loaded)
+                skill = str(args.get("name", ""))
+                # Counted, so a skill nobody loads shows up stale (folders.SKILLS_HINT, the curator).
+                host.audit(db, organization_id=org, agent_id=agent.id, tool=USE_SKILL, risk=READ,
+                           decision="allow" if skill in loaded else "deny", rule="skill_loaded"
+                           if skill in loaded else "unknown_skill", task_id=task.id, actor=actor,
+                           target=skill[:80] or None)
                 have = {t["function"]["name"] for t in tools}
                 tools[:0] = [host.tools[n].schema for n in allowed
                              if n in added and n not in have and offers(n)]
@@ -1052,8 +1128,9 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
                     sent_round.add(reach)
                 # One owner click on the whole batch beats N clicks. A tool message is still
                 # owed for every call id, or the next request carries an unanswered call.
+                # `rule`: the gate's rule, so the card can tell the owner why they are asked.
                 awaiting.append({"tool_call_id": tc.id, "tool": tool_name,
-                                 "args": host.clean_args(args)})
+                                 "args": host.clean_args(args), "rule": decision.rule})
                 continue
             if decision.outcome == gate.ALLOW:
                 if await asked_to_stop(host, task):
@@ -1135,7 +1212,7 @@ async def _run(host, db, task: Any, usage: Usage, *, actor: str, llm: Optional[t
     wrap_up = {"role": "user", "content": WRAP_UP}
     resp = await client.chat.completions.create(model=model, extra_body=host.extra_body(model),
                                                 messages=[system, *with_clock(history, note), wrap_up])
-    spend(task, usage, resp)
+    spend(host, task, usage, resp, model)
     text = resp.choices[0].message.content or ""
     return await _finish(host, db, task, history, host.clean_text(text) or host.OUT_OF_STEPS,
                          actor, shown)

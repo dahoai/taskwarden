@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.0 (2026-11-24)
+
+- `tasks.tokens` counts a cached input token at `host.cached_weight(model)` of a full one (what the
+  provider bills for a cache hit), so budgets and anything charged from the count follow the real
+  cost. `BaseHost` keeps 1.0 (unchanged). `loop.spend` now takes the host and the model.
+- Code mode, off by default: with `host.code_runner` set (`MontyRunner`, extra `[code]` = `pydantic-monty`) and `host.code_mode(agent, task)` true, the agent is offered `run_code`, a Python script that calls its read tools as async functions; only the printed output and last value go back to the model. Every call passes the gate and is audited; anything but an ALLOWed read raises in the script. `taskwarden/code.py`, `CodeRunner` to bring another sandbox.
+- `tools.ToolFailed(message, retryable=False)`: a handler's failure, counted as one (audited `handler_failed`, never a send or "done"). The model is told whether another try can help; a READ that may pass is retried once in code (`READ_RETRIES`, `RETRY_DELAY_SECONDS`). Measured: the retryable wording took gpt-4.1-mini from 0% to 63% retries on a transient failure.
+- `AgentState.blocked_tools`: the owner's "never do this". The gate denies a blocked tool (rule
+  `owner_blocked`) in every setting and on every task, before practice and trust.
+- `host.unbacked(db, task, text)`: optional. A report that claims something no call of the task did
+  is sent back once with the host's words, after the loop's own nudges.
+- Each `use_skill` is audited (risk `read`, target = the skill), so skill usage can be counted.
+- Two replies at once both reach the task: `replies.wake` locks the task row (the reply is appended to its
+  JSON state, and the second commit used to drop the first), and a reply joins a task still `queued`
+  by an earlier one instead of being dropped. The sweeper loads a task only after claiming it, so the run
+  sees every reply that joined while it waited.
+
 ## 0.8.0 (2026-11-12)
 
 Adds columns to `TaskColumns`: `request_id`, `state_version`, `prompt_hashes` (a host with its own

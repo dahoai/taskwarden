@@ -48,6 +48,15 @@ SLOW = "Tool error: it took too long and was stopped. Try once more, or another 
 # Not a READ: it may have done its work before it was stopped.
 SLOW_MAYBE_DONE = ("Unknown: it took too long and was stopped, so it may have gone through. "
                    "Check before doing it again.")
+# A ToolFailed says whether another try can work. Without it a model either never retries or
+# retries a send that can only fail the same way (three texts to an unreachable number,
+# 2026-11); told so, it retries the one and stops at the other (course research C7d-C7e).
+MAY_RETRY = "It may work if tried once more."
+NO_RETRY = "Don't call it again the same way."
+# A READ that failed for a reason that may pass is tried again here, once, before the model
+# sees it: models that never retry (C7d: gpt-4.1-mini, 0 of 240) then still recover.
+READ_RETRIES = 1
+RETRY_DELAY_SECONDS = 1.0
 
 
 class NeedsConnect(Exception):
@@ -59,6 +68,17 @@ class NeedsConnect(Exception):
     def __init__(self, account: str, url: Optional[str] = None) -> None:
         super().__init__(account)
         self.account, self.url = account, url
+
+
+class ToolFailed(Exception):
+    """Raised by a handler when the call did not do its work: the model gets "Tool error:
+    <message>" and whether trying again can help, and the loop counts it as failed (audited,
+    not a send, not "done"). Returning the failure as a plain string instead reads as success.
+    Raise it only when nothing went through: a handler that may have done its work returns."""
+
+    def __init__(self, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.message, self.retryable = message, retryable
 
 
 @dataclass(frozen=True)
@@ -159,32 +179,52 @@ async def execute(tool: Tool, ctx: Any, args: dict[str, Any], *,
     ok is True, False, or None when nobody knows: a non-READ call stopped at its timeout may
     have done its work, so a send that ends that way still counts as sent."""
     limit = getattr(tool, "timeout", TOOL_TIMEOUT_SECONDS)
+    tries = 1 + (READ_RETRIES if tool.risk == READ else 0)
     with scope(ctx):
-        try:
-            out = await asyncio.wait_for(
-                tool.handler(ctx, **declared_args(tool, clean_args(args, owned))), limit)
-            if tool.risk != READ:
-                await _commit(ctx)
-            return out, True
-        except NeedsConnect:  # nothing ran: the caller parks the task for the owner
-            await _rollback(ctx)
-            raise
-        except asyncio.TimeoutError:
-            logger.warning("team_tool_timeout tool=%s organization_id=%s seconds=%s",
-                           tool.name, _org(ctx), limit)
-            await _rollback(ctx)  # stopped mid-write: the session can't be trusted as it is
-            return (SLOW, False) if tool.risk == READ else (SLOW_MAYBE_DONE, None)
-        except ValueError:
-            logger.warning("team_tool_bad_value tool=%s organization_id=%s", tool.name, _org(ctx),
-                           exc_info=True)
-            return BAD_VALUE, False
-        except TypeError:  # a required argument missing
-            logger.warning("team_tool_bad_args tool=%s organization_id=%s", tool.name, _org(ctx),
-                           exc_info=True)
-            return BAD_ARGS, False
-        except Exception:
-            logger.exception("team_tool_failed tool=%s organization_id=%s", tool.name, _org(ctx))
-            return FAILED, False
+        for attempt in range(1, tries + 1):
+            last = attempt == tries
+            try:
+                out = await asyncio.wait_for(
+                    tool.handler(ctx, **declared_args(tool, clean_args(args, owned))), limit)
+                if tool.risk != READ:
+                    await _commit(ctx)
+                if attempt > 1:
+                    logger.info("team_tool_retry_recovered tool=%s organization_id=%s",
+                                tool.name, _org(ctx))
+                return out, True
+            except NeedsConnect:  # nothing ran: the caller parks the task for the owner
+                await _rollback(ctx)
+                raise
+            except asyncio.TimeoutError:  # not retried here: a second wait would double it
+                logger.warning("team_tool_timeout tool=%s organization_id=%s seconds=%s",
+                               tool.name, _org(ctx), limit)
+                await _rollback(ctx)  # stopped mid-write: the session can't be trusted as it is
+                return (SLOW, False) if tool.risk == READ else (SLOW_MAYBE_DONE, None)
+            except ToolFailed as e:
+                await _rollback(ctx)
+                logger.warning("team_tool_failed tool=%s organization_id=%s retryable=%s",
+                               tool.name, _org(ctx), e.retryable)
+                if e.retryable and not last:
+                    await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
+                    continue
+                return f"Tool error: {e.message} {MAY_RETRY if e.retryable else NO_RETRY}", False
+            except ValueError:
+                logger.warning("team_tool_bad_value tool=%s organization_id=%s", tool.name,
+                               _org(ctx), exc_info=True)
+                return BAD_VALUE, False
+            except TypeError:  # a required argument missing
+                logger.warning("team_tool_bad_args tool=%s organization_id=%s", tool.name,
+                               _org(ctx), exc_info=True)
+                return BAD_ARGS, False
+            except Exception:
+                logger.exception("team_tool_failed tool=%s organization_id=%s", tool.name,
+                                 _org(ctx))
+                if not last:  # a READ: a blip upstream often passes
+                    await _rollback(ctx)
+                    await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
+                    continue
+                return FAILED, False
+    raise AssertionError("unreachable")  # every attempt returns or continues
 
 
 async def check(tool: Tool, ctx: Any, args: dict[str, Any], *,

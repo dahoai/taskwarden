@@ -2,7 +2,8 @@
 
 The task already keeps what it sent (`contacted`: "tool|recipient|body", from its own runs and
 from sends the owner approved), so no subscription is stored: the newest finished task that
-reached this person in the last WINDOW gets the reply appended and goes back to the queue.
+reached this person in the last WINDOW gets the reply appended and goes back to the queue
+(or, already queued by an earlier reply, takes this one too).
 What the person wrote is fenced like any other outside text, and the task's later runs are
 outside-woken (loop): they read and draft, but send, spend and change wait for the owner's click.
 A task is woken at most MAX_WAKES times, so a chatty customer can't keep it running.
@@ -46,11 +47,15 @@ async def wake(host, db, organization_id: str, reach_keys: list[str], note: str,
         return None
     Task = host.Task
     contacted = cast(Task.contacted, Text)
+    # Locked: the reply is appended to the task's JSON state, so two replies at once would
+    # otherwise each write their own copy and one would be lost. A task already queued (an
+    # earlier reply woke it, it hasn't run yet) takes this reply too: the sweeper loads a task
+    # only after claiming it, so the run sees both. A running task is left alone.
     task = (await db.execute(select(Task).where(
-        Task.organization_id == organization_id, Task.status == "done",
+        Task.organization_id == organization_id, Task.status.in_(("done", "queued")),
         Task.updated_at >= now - WINDOW,
         or_(*[contacted.contains(f'"{key}|', autoescape=True) for key in reach_keys]),
-    ).order_by(Task.updated_at.desc()).limit(1))).scalars().first()
+    ).order_by(Task.updated_at.desc()).limit(1).with_for_update())).scalars().first()
     if task is None or wakes(task.state) >= MAX_WAKES:
         return None
     task.state = [*(task.state or []), {

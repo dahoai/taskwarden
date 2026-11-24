@@ -294,6 +294,72 @@ async def test_a_send_stopped_at_its_timeout_counts_as_sent():
     assert task.contacted == ["send_text|+15145550142|Tech at 10?"]
 
 
+# ── A failure says whether another try can work; a READ is tried once more in code ──
+
+def _flaky(*outcomes):
+    """A handler that raises or returns each outcome in turn, and counts its calls."""
+    calls = []
+
+    async def handler(ctx, **kw):
+        calls.append(kw)
+        out = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(out, BaseException):
+            raise out
+        return out
+    return handler, calls
+
+
+@pytest.fixture
+def no_wait(monkeypatch):
+    monkeypatch.setattr(tools, "RETRY_DELAY_SECONDS", 0)
+
+
+async def test_a_read_that_fails_once_is_retried_in_code_and_the_model_sees_the_data(no_wait):
+    for blip in (tools.ToolFailed("calendar unreachable", retryable=True), RuntimeError("502")):
+        handler, calls = _flaky(blip, "10:00 free")
+        tool = tools.Tool("slots", tools.READ, tools.fn_schema("slots", "x"), handler)
+        assert await tools.execute(tool, SimpleNamespace(), {}) == ("10:00 free", True)
+        assert len(calls) == 2
+
+
+async def test_a_read_that_keeps_failing_is_tried_twice_then_says_it_may_work_later(no_wait):
+    handler, calls = _flaky(tools.ToolFailed("calendar unreachable.", retryable=True))
+    tool = tools.Tool("slots", tools.READ, tools.fn_schema("slots", "x"), handler)
+    out, ok = await tools.execute(tool, SimpleNamespace(), {})
+    assert (out, ok) == (f"Tool error: calendar unreachable. {tools.MAY_RETRY}", False)
+    assert len(calls) == 1 + tools.READ_RETRIES
+
+
+async def test_a_failure_that_cannot_pass_is_not_retried_and_says_so(no_wait):
+    handler, calls = _flaky(tools.ToolFailed("no such page.", retryable=False))
+    tool = tools.Tool("page", tools.READ, tools.fn_schema("page", "x"), handler)
+    assert await tools.execute(tool, SimpleNamespace(), {}) == (
+        f"Tool error: no such page. {tools.NO_RETRY}", False)
+    assert len(calls) == 1
+
+
+async def test_a_send_is_never_retried_in_code(no_wait):
+    handler, calls = _flaky(tools.ToolFailed("provider down.", retryable=True))
+    tool = tools.Tool("send", tools.CONTACT, tools.fn_schema("send", "x"), handler)
+    assert (await tools.execute(tool, SimpleNamespace(), {}))[1] is False
+    assert len(calls) == 1
+
+
+async def test_a_send_that_failed_is_audited_and_does_not_count_as_sent():
+    host, task, db = TextingHost(), _task(), _db()
+    host.tools["send_text"] = replace(host.tools["send_text"], handler=_flaky(
+        tools.ToolFailed("unreachable number."))[0])
+    host.agent = lambda agent_id: Agent(agent_id, "Lead", tools=("send_text",))
+    host.audit = MagicMock()
+    send = {"to": "+15145550142", "body": "Tech at 10?"}
+    llm = _llm(Msg(calls=[("send_text", send)]), Msg("The text did not go through."))
+    assert await loop.run_task(host, db, task, llm=(llm, "m")) == "done"
+    results = [m["content"] for m in task.state if m["role"] == "tool"]
+    assert results == [f"Tool error: unreachable number. {tools.NO_RETRY}"]
+    assert task.contacted == []
+    assert any(c.kwargs.get("rule") == "handler_failed" for c in host.audit.call_args_list)
+
+
 # ── The owner rewrites a message before approving it ──
 
 def test_only_text_the_call_already_had_can_be_edited():
@@ -325,6 +391,33 @@ async def _park_refund(host):
     host.execute = AsyncMock(side_effect=AssertionError("must not run"))
     host.audit = MagicMock()
     return task, db
+
+
+async def test_a_decision_on_an_older_version_of_the_proposal_is_stale():
+    host = ShopHost()
+    task, db = await _park_refund(host)
+    rev = task.pending["rev"]
+    assert rev and isinstance(rev, str)
+    assert await decisions.claim(host, db, "shop1", task.id, "approve", rev="an-older-one") == "stale"
+    assert task.status == "waiting"  # nothing claimed
+    db.execute = AsyncMock(side_effect=[SimpleNamespace(scalar_one_or_none=lambda: task),
+                                        SimpleNamespace(scalar_one_or_none=lambda: task.id)])
+    assert await decisions.claim(host, db, "shop1", task.id, "approve", rev=rev) is task
+
+
+async def test_a_decision_without_a_version_is_claimed_as_before():
+    host = ShopHost()
+    task, db = await _park_refund(host)
+    db.execute = AsyncMock(side_effect=[SimpleNamespace(scalar_one_or_none=lambda: task),
+                                        SimpleNamespace(scalar_one_or_none=lambda: task.id)])
+    assert await decisions.claim(host, db, "shop1", task.id, "approve") is task
+
+
+async def test_each_park_is_a_new_version():
+    host = ShopHost()
+    first, _ = await _park_refund(host)
+    second, _ = await _park_refund(host)
+    assert first.pending["rev"] != second.pending["rev"]
 
 
 async def test_an_approval_is_checked_again_on_the_args_the_owner_edited():
@@ -486,6 +579,26 @@ def test_usage_counts_deepseek_and_openai_cache_hits():
                                                 prompt_tokens_details=SimpleNamespace(cached_tokens=640))))  # OpenAI
     u.add(SimpleNamespace())  # no usage reported
     assert (u.requests, u.prompt, u.cached, u.completion) == (3, 1800, 1540, 70)
+
+
+def test_cached_input_counts_at_the_hosts_weight():
+    resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10_000, completion_tokens=500,
+                                                 prompt_cache_hit_tokens=9_000))
+    assert loop.Usage().add(resp) == 10_500  # no weight: every token in full
+    assert loop.Usage().add(resp, 0.02) == 1_000 + 180 + 500
+    # A report that claims more cached than sent, or a weight outside 0..1, never goes negative
+    # or above full price.
+    odd = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=0,
+                                                prompt_cache_hit_tokens=300))
+    assert loop.Usage().add(odd, -1) == 0 and loop.Usage().add(odd, 5) == 100
+
+    task = _task()
+    host = ShopHost()
+    loop.spend(host, task, loop.Usage(), resp, "m")
+    assert task.tokens == 10_500  # BaseHost counts cached input in full
+    host.cached_weight = lambda model: 0.1 if model == "cheap-cache" else 1.0
+    loop.spend(host, task, loop.Usage(), resp, "cheap-cache")
+    assert task.tokens == 10_500 + 1_000 + 900 + 500
 
 
 async def test_a_run_logs_its_usage_however_it_ends(caplog):
@@ -768,3 +881,117 @@ async def test_a_summary_never_splits_a_tool_result_from_its_call_and_a_failure_
         raise RuntimeError("down")
     broken = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=boom)))
     assert await loop.summarize(broken, "m", ShopHost(), _task(), loop.Usage(), history) == history
+
+
+# ── A reply cut off by the length limit is not a finished one ──
+
+def _cutting(*replies):
+    """Replies as (message, finish_reason); every request is kept, tools included."""
+    sent, queue = [], list(replies)
+
+    async def create(**kw):
+        sent.append(kw)
+        message, finish = queue.pop(0)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish)])
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), sent
+
+
+async def test_an_answer_cut_off_is_asked_for_again_shorter_and_only_the_whole_one_is_posted():
+    host, task = ShopHost(), _task()
+    llm, sent = _cutting((Msg("Two orders came in today, the first was a"), "length"),
+                         (Msg("Two orders today."), "stop"))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert [m["content"] for m in sent[1]["messages"][-2:]] == [
+        "Two orders came in today, the first was a", loop.CUT_TEXT]
+    assert [p["body"] for p in host.posted] == ["Two orders today."]
+
+
+async def test_an_answer_cut_off_twice_is_posted_as_it_is_rather_than_asked_for_forever():
+    host, task = ShopHost(), _task()
+    llm, sent = _cutting((Msg("First half"), "length"), (Msg("Second try, still long and"), "length"))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert len(sent) == 2
+    assert host.posted[-1] == {"body": "Second try, still long and"}
+
+
+async def test_a_call_cut_off_is_never_run_and_the_model_is_told_to_make_it_again():
+    host, task = ShopHost(), _task()
+    llm, sent = _cutting((Msg(calls=[("read_orders", {})]), "length"),
+                         (Msg(calls=[("read_orders", {})]), "tool_calls"),
+                         (Msg("Two orders today."), "stop"))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    tools_seen = [m for m in task.state if m.get("role") == "tool"]
+    assert [m["content"] for m in tools_seen] == [loop.CUT_TOOL, "2 orders today"]
+    assert host.posted[-1] == {"body": "Two orders today."}
+
+
+async def test_a_spend_cut_off_mid_arguments_does_not_run_or_ask_the_owner():
+    host, task = ShopHost(), _task()
+    llm, _ = _cutting((Msg(calls=[("refund", {"order_id": "A1"})]), "length"),
+                      (Msg("I could not finish that refund; ask me again."), "stop"))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert not host.told                         # nothing was put to the owner
+    assert task.pending is None
+    assert host.posted[-1] == {"body": "I could not finish that refund; ask me again."}
+
+
+async def test_calls_cut_off_again_and_again_end_in_a_reply_with_no_tools():
+    host, task = ShopHost(), _task()
+    llm, sent = _cutting((Msg(calls=[("read_orders", {})]), "length"),
+                         (Msg(calls=[("read_orders", {})]), "length"),
+                         (Msg("I could not read the orders."), "stop"))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert len(sent) == 3 and "tools" not in sent[2]      # the last request offers none
+    assert host.posted[-1] == {"body": "I could not read the orders."}
+
+
+async def test_a_reply_that_finished_is_untouched_by_all_of_this():
+    host, task = ShopHost(), _task()
+    llm, sent = _cutting((Msg("Two orders today."), "stop"))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert len(sent) == 1 and host.posted[-1] == {"body": "Two orders today."}
+
+
+# ── A report that says it did something no call did, and the owner's block list ──
+
+@dataclass
+class CheckingHost(ShopHost):
+    checked: list = field(default_factory=list)
+
+    async def unbacked(self, db, task, text):
+        self.checked.append(text)
+        return "Check: nothing was sent." if "I emailed" in text else None
+
+
+async def test_a_report_claiming_an_unmade_call_is_sent_back_once():
+    host, task = CheckingHost(), _task()
+    llm, sent = _recording(Msg("I emailed the customer."), Msg("I emailed them yesterday."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    assert sent[1][-1]["content"] == "Check: nothing was sent."
+    assert host.checked == ["I emailed the customer."]  # once a run: the second report stands
+    assert host.posted[-1] == {"body": "I emailed them yesterday."}
+
+
+def test_a_blocked_tool_is_refused_whatever_the_setting_or_trust():
+    host = ShopHost()
+    state = gate.AgentState(setting="allow", trusted_tools=frozenset({"refund"}),
+                            blocked_tools=frozenset({"refund"}))
+    assert gate.decide(Agent("lead", "Lead"), host.tools["refund"], state) == \
+        gate.Decision(gate.DENY, gate.OWNER_BLOCKED)
+    practice = replace(state, setting=gate.OBSERVE)
+    assert gate.decide(Agent("lead", "Lead"), host.tools["refund"], practice).outcome == gate.DENY
+    assert gate.decide(Agent("lead", "Lead"), host.tools["read_orders"], state).outcome == gate.ALLOW
+
+
+async def test_each_skill_load_is_audited_so_unused_skills_show():
+    from taskwarden.folders import AgentFolder, Skill
+    folder = AgentFolder(id="lead", name="Lead", title="Helper", core="You help.", tools=("read_orders",),
+                         skills=(Skill("refunds", "Refunding orders", ("refund",), "How to refund."),),
+                         on_demand=True)
+    host, task, audited = ShopHost(), _task(), []
+    host.agent = lambda agent_id: Agent(agent_id, "Lead", folder=folder)
+    host.audit = lambda db, **kw: audited.append(kw)
+    llm = _llm(Msg(calls=[("use_skill", {"name": "refunds"}), ("use_skill", {"name": "nope"})]), Msg("Ready."))
+    assert await loop.run_task(host, _db(), task, llm=(llm, "m")) == "done"
+    loads = [(a["tool"], a["decision"], a["target"]) for a in audited if a["tool"] == "use_skill"]
+    assert loads == [("use_skill", "allow", "refunds"), ("use_skill", "deny", "nope")]

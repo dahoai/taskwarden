@@ -31,6 +31,7 @@ unattended, on real accounts, for many businesses at once, hits these:
 | An approval waits a week | Parked tasks live in **your database**, not in memory: approve from any process, until `APPROVAL_TTL` (7 days by default) expires the wait. |
 | The agent needs an account nobody connected yet | A tool raises `NeedsConnect("Gmail", url)`: the task parks on a **connect card**, and once the owner connects it the agent retries and carries on, instead of saying it can't. |
 | A tool hangs | Each tool has a **timeout**; a send stopped by it counts as sent. |
+| A tool fails, and the model either gives up or retries something that can't work | The handler raises `ToolFailed(message, retryable)`: a read that may pass is **tried once more in code**, and the model is told whether another try can help. A failed send is audited and never counts as sent. |
 | A long task overflows the model's context | Old tool results are **compacted** before the run is made to wrap up. |
 | The model repeats the same call | It is **reminded once**, then stopped. |
 | A customer writes back | Their reply **wakes the task** that wrote to them, fenced as outside text; the woken task can update its records, but a send or a spend waits for the owner. |
@@ -182,6 +183,17 @@ finishes without a word. Use it for "keep an eye on the status page".
 Agents can set up their own routines: give one `triggers.routine_tool(host, save)` and write
 `custom_triggers(db, org)` to read back what `save` stored. Adding a routine is a `profile`
 call, so it always waits for the owner's click.
+
+## Failed calls
+
+A handler whose call did not do its work raises `tools.ToolFailed(message, retryable=False)`
+instead of returning the failure as text (a returned string reads as success: a failed text
+would count as sent). The model gets `Tool error: <message>` and either "It may work if tried
+once more." (`retryable=True`: the service didn't answer) or "Don't call it again the same
+way." (the number can't take texts, the input was refused). A READ tool that raises a
+retryable `ToolFailed` or an unexpected exception is run once more in code, after
+`RETRY_DELAY_SECONDS`, before the model sees anything; other tiers are never rerun. Raise it
+only when nothing went through.
 
 ## Missing accounts
 

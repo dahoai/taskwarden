@@ -89,6 +89,10 @@ class Host(Protocol):
         """The tool's own check before the owner is asked. Must not raise, except
         tools.NeedsConnect: a check that fails to run returns None, and the owner is asked as
         before."""
+    async def unbacked(self, db: Any, task: Any, text: str) -> Optional[str]:
+        """Optional. Before a report is taken as the answer: the words to send it back with
+        when it says something was done (sent, booked) that no call of this task did, else
+        None. Asked once a run, after the loop's own nudges; must not raise."""
     def clean_args(self, args: dict) -> dict:
         """The arguments a parked call keeps: without the ones the server owns."""
     def use_skill(self, agent: Any, args: dict, loaded: set[str]) -> tuple[str, tuple[str, ...]]:
@@ -162,6 +166,9 @@ class BaseHost:
     # How long a task may wait on a person (the owner's approval or answer, a teammate's
     # answer) before the sweeper expires it. None = the sweeper's EXPIRE_AFTER (7 days).
     APPROVAL_TTL: Optional[timedelta] = None
+    # Code mode (taskwarden.code): a sandbox for `run_code` scripts over the read tools, e.g.
+    # MontyRunner(). None = no scripts. `code_mode` says which agents and tasks get it.
+    code_runner: Any = None
     STOPPED_REPLY = "Stopped."
     STOPPED_DID = "Done before that: {did}."
 
@@ -235,6 +242,14 @@ class BaseHost:
 
     def region(self, company: dict) -> str:
         return str(company.get("country") or "")
+
+    def code_mode(self, agent, task) -> bool:
+        return False
+
+    def cached_weight(self, model: str) -> float:
+        """What one cached input token costs next to an uncached one on `model` (DeepSeek's
+        cache hits, OpenAI's cached input), as `tasks.tokens` counts it. 1.0 counts it in full."""
+        return 1.0
 
     # ── Each call ──
     def decide(self, agent, tool, state, *, self_started) -> Decision:

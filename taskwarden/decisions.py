@@ -68,9 +68,12 @@ def answered(state: list, results: list[dict]) -> list:
     return out + list(by_id.values())  # any answer whose placeholder was missing
 
 
-async def claim(host, db, organization_id: str, task_id: Any, decision: str):
+async def claim(host, db, organization_id: str, task_id: Any, decision: str,
+                rev: Optional[str] = None):
     """Check the decision fits the parked task and claim it ("running"), committed. The task,
-    or why not: "not_found" | "conflict" | "invalid"."""
+    or why not: "not_found" | "conflict" | "invalid" | "stale". `rev`, when given, is the
+    proposal version the decider saw (pending["rev"], new at each park): a different one is
+    "stale", so an old tab never decides what the task proposed since. No `rev`: not checked."""
     Task = host.Task
     task = (await db.execute(select(Task).where(
         Task.id == task_id, Task.organization_id == organization_id
@@ -84,6 +87,10 @@ async def claim(host, db, organization_id: str, task_id: Any, decision: str):
         return "not_found"  # nothing for the owner to decide: a teammate is answering this one
     if (pending.get("kind") == "approval") != (decision in APPROVAL_DECISIONS):
         return "invalid"
+    # ponytail: rev is read here, not in the UPDATE below. A re-park between the two needs a
+    # whole claim, run and park inside that gap; put rev in the WHERE if that ever matters.
+    if rev is not None and pending.get("rev") != rev:
+        return "stale"
     claimed = (await db.execute(update(Task).where(
         Task.id == task_id, Task.status == "waiting"
     ).values(status="running").returning(Task.id))).scalar_one_or_none()
